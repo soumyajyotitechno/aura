@@ -9,6 +9,24 @@ const app = express();
 GROUP_ID = 5
 
 
+// API hit log: one line per request (method, path, status, ms) for EVERY route. me&u routes also print the request and
+// response bodies, with mobile/email masked; headers and query strings are never logged. MEU_LOG_BODIES=false turns bodies off.
+const LOG_BODIES = process.env.MEU_LOG_BODIES !== 'false';
+const maskPii = (k, v) => (/^(mobile|phone|email)$/i.test(k) && typeof v === 'string' ? v.replace(/.(?=.{3})/g, '*') : v);
+app.use((req, res, next) => {
+  const start = Date.now();
+  const json = res.json.bind(res);
+  res.json = (body) => { // logged here, before the reply goes out, so Lambda can't freeze before the line is written
+    console.log(`[API] ${req.method} ${req.path} -> ${res.statusCode} (${Date.now() - start}ms)`);
+    if (LOG_BODIES && /^\/(meu\/|auto-linking)/.test(req.path)) {
+      console.log('[API]   in :', JSON.stringify(req.body, maskPii));
+      console.log('[API]   out:', JSON.stringify(body, maskPii));
+    }
+    return json(body);
+  };
+  next();
+});
+
 // Capture raw body + parse JSON in one step
 app.use(express.json({
   limit: '5mb',
@@ -750,27 +768,54 @@ function signMeuPayload(payload) {
 }
 
 
-async function sendMeuErrorAlert(errorMsg, subject = "ERROR/WARNING: ") {
+// Records a confirmation row in meu_link_status_log so it's queryable whether a given
+// me&u event ended up SAVED, NOT_SAVED (nothing matched, no error) or ERROR.
+async function logMeuLinkStatus({ eventType, status, programId, externalId, membershipId, memberId, message }) {
   try {
-    let data = JSON.stringify({ subject, error: { msg: errorMsg } });
-    let config = {
-      method: "post",
-      maxBodyLength: Infinity,
-      url: "https://yr45p2qpb7.execute-api.ap-southeast-2.amazonaws.com/v1/internal_email_alert",
-      headers: {
-        "x-api-key": process.env.INTERNAL_ALERT_API_KEY,
-        "Content-Type": "application/json",
-      },
-      data: data,
-    };
-    let response = await axios.request(config);
-    console.log("Email alert sent successfully:", JSON.stringify(response.data));
-  } catch (error) {
-    console.log("Failed to send email alert:", error.message);
+    await queryDatabase(
+      `INSERT INTO meu_link_status_log (event_type, status, program_id, external_id, membership_id, member_id, message)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [eventType, status, programId || null, externalId || null, membershipId || null, memberId || null, message || null]
+    );
+  } catch (err) {
+    console.error('Failed to write meu_link_status_log:', err.message);
   }
 }
 
+// Saves me&u's membership id against the Aura member in meu_member_linking, using the memberId
+// passed straight from the payload -- no lookup against aura_customer or any other table.
+// Never fails the request: me&u has already created the membership, so a DB problem only raises an alert.
+async function meuSaveLink(programId, externalId, membershipId, memberId) {
+  if (!externalId || !membershipId || !memberId) {
+    return console.log("me&u link not saved: payload.memberId, payload.externalId or the returned membership id is missing");
+  }
+  try {
+    const rows = await queryDatabase(
+      `INSERT INTO meu_member_linking (member_id, external_id, program_id, membership_id)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (program_id, member_id) DO UPDATE SET membership_id = EXCLUDED.membership_id
+       RETURNING member_id`,
+      [memberId, externalId, programId, membershipId]
+    );
+    console.log("[meu] link saved", JSON.stringify({ programId, externalId, membershipId, memberId: rows[0].member_id }));
+    await logMeuLinkStatus({ eventType: "MEU_AUTO_LINKING", status: "SAVED", programId, externalId, membershipId, memberId: rows[0].member_id });
+  } catch (err) {
+    console.error("me&u link not saved:", err.message);
+    await storeErrorLog({
+      requestPayload: JSON.stringify({ programId, externalId, membershipId, memberId }),
+      memberId,
+      eventType: "MEU_AUTO_LINKING",
+      errorType: err.name,
+      errorMessage: err.message,
+    });
+    await logMeuLinkStatus({ eventType: "MEU_AUTO_LINKING", status: "ERROR", programId, externalId, membershipId, memberId, message: err.message });
+  }
+}
+
+
 // POST /auto-linking
+// Aura core -> here -> me&u. The program must be configured (meu_partner_program_config); on success the
+// returned me&u membership id is saved to meu_member_linking.
 app.post("/auto-linking", async (req, res) => {
   const { programId, payload } = req.body || {};
 
@@ -778,30 +823,38 @@ app.post("/auto-linking", async (req, res) => {
     return res.status(400).json({ error: "programId and payload are required" });
   }
 
-  // MEU_DUMMY_MODE=true -> skip the outbound call and return a fake membership
-  if (process.env.MEU_DUMMY_MODE === "true") {
-    console.log("MEU_DUMMY_MODE: skipping me&u call for programId", programId);
-    return res.status(202).json({
-      status: 202,
-      body: { id: "dummy-membership-id" },
-    });
-  }
-
   try {
-    const bodyString = JSON.stringify(payload);
-    const response = await axios.post(
-      `${MEU_BASE_URL}/v0/membership-programs/${programId}/memberships`,
-      bodyString,
-      {
-        headers: {
-          "x-provider-id": MEU_PROVIDER_ID,
-          "x-signature-sha256": signMeuPayload(bodyString),
-          "Content-Type": "application/json",
-        },
-      }
+    const configured = await queryDatabase(
+      `SELECT 1 FROM meu_partner_program_config WHERE program_id = $1 AND active = true LIMIT 1`,
+      [programId]
     );
+    if (!configured.length) return res.status(404).json({ error: "Program not configured for me&u" });
 
-    return res.status(response.status).json(response.data);
+    let status, data;
+    if (process.env.MEU_DUMMY_MODE === "true") {
+      // skip the outbound call and return a fake membership (unique id: the link table keeps one row per me&u membership)
+      console.log("MEU_DUMMY_MODE: skipping me&u call for programId", programId);
+      status = 202;
+      data = { status: 202, body: { id: `dummy-membership-id-${Date.now()}` } };
+    } else {
+      const bodyString = JSON.stringify(payload);
+      const response = await axios.post(
+        `${MEU_BASE_URL}/v0/membership-programs/${programId}/memberships`,
+        bodyString,
+        {
+          headers: {
+            "x-provider-id": MEU_PROVIDER_ID,
+            "x-signature-sha256": signMeuPayload(bodyString),
+            "Content-Type": "application/json",
+          },
+        }
+      );
+      status = response.status;
+      data = response.data;
+    }
+
+    await meuSaveLink(programId, payload.externalId, data && (data.id || (data.body && data.body.id)), payload.memberId);
+    return res.status(status).json(data);
   } catch (error) {
     console.error("Error in /auto-linking:", error.response ? error.response.data : error.message);
     return res.status(error.response ? error.response.status : 500).json({
@@ -832,11 +885,36 @@ app.post('/meu/membership-link', async (req, res) => {
 
   try {
     client = await pool.connect();
-
+// validate mobile no
     if (!mobile) {
       status = 'error';
       message = 'mobile is required';
       return res.status(400).json({ message });
+    }
+
+    // Validate against our config + link table. Read-only: search/link never inserts anything.
+    if (programId) {
+      const configured = await client.query(
+        `SELECT 1 FROM meu_partner_program_config WHERE program_id = $1 AND active = true LIMIT 1`,
+        [programId]
+      );
+      if (configured.rowCount === 0) {
+        status = 'error';
+        message = 'Program not configured for me&u';
+        return res.status(404).json({ message });
+      }
+
+      // an id we already linked on this program beats a phone/email match
+      if (externalMembershipId) {
+        const linked = await client.query(
+          `SELECT external_id FROM meu_member_linking WHERE program_id = $1 AND external_id = $2`,
+          [programId, externalMembershipId]
+        );
+        if (linked.rowCount > 0) {
+          message = 'Membership already linked';
+          return res.status(200).json({ membershipId: linked.rows[0].external_id });
+        }
+      }
     }
 
     // Search for an existing membership created outside me&u (same lookup)
@@ -865,7 +943,7 @@ app.post('/meu/membership-link', async (req, res) => {
     console.error('Error in /meu/membership-link:', err);
     status = 'error';
     message = err.message;
-    await sendMeuErrorAlert({ message: err.message, name: err.name, stack: err.stack }, 'MEU_MEMBERSHIP_LINKING: ERROR');
+    await logMeuLinkStatus({ eventType: 'MEU_MEMBERSHIP_LINKING', status: 'ERROR', programId, externalId: externalMembershipId, message: err.message });
     return res.status(500).json({ message });
   } finally {
     const insertLogQuery = `
@@ -883,7 +961,7 @@ app.post('/meu/membership-link', async (req, res) => {
 
 // ---- me&u "Displaying points balance and rewards" (me&u -> Aura) ----
 // Hot: me&u calls this on every venue home / cart view and every cart change, so it stays thin --
-// no aura_logs on success, and it only writes when an applied reward has to be re-capped.
+// no aura_logs on success, and the balance call never writes anything.
 // Offers/deals/promo codes are out of scope: `rewards` holds at most the one cashback PointShopOffer.
 const MEU_API_KEY = process.env.MEU_API_KEY;               // issued to me&u (X-Api-Key)
 const MEU_INBOUND_SECRET = process.env.MEU_INBOUND_SECRET; // me&u's key for x-signature-sha256
@@ -934,7 +1012,7 @@ async function getMeuBalanceCents(partnerId, externalId) {
   let data;
   if (process.env.MEU_DUMMY_MODE === 'true') {
     const m = /^dummy-(\d+(?:\.\d+)?)$/.exec(externalId);
-    data = { success: true, valid: true, balance: m ? Number(m[1]) : 12.34 };
+    data = { success: true, valid: true, balance: (m ? Number(m[1]) : 12.34) - (meuDummyDeducted.get(externalId) || 0) / 100 };
   } else {
     data = await callRedemptionService(`enquiry?partnerId=${partnerId}&barcodeText=${encodeURIComponent(externalId)}`);
   }
@@ -942,14 +1020,21 @@ async function getMeuBalanceCents(partnerId, externalId) {
   return { cents: data.valid ? Math.round(Number(data.balance || 0) * 100) : 0 }; // invalid (inactive) member = 0
 }
 
-// ---- the one points offer (PointShopOffer) and its holds; shared by /meu/points-balance and /meu/apply-reward ----
-// Applying only RESERVES points (meu_reward_hold); the real deduction happens on the later cart-submitted webhook.
+// ---- the one points offer (PointShopOffer); shared by /meu/points-balance and /meu/apply-reward ----
+// Applying DEDUCTS the cashback straight away (Redemption Service `redeem`). There is no hold, expiry or auto-refund:
+// if the guest removes the reward or abandons the cart, giving the points back is me&u's call, not Aura's.
 const MEU_OFFER_ID = 'aura-cashback';
-const MEU_HOLD_TTL_MIN = Math.round(Number(process.env.MEU_HOLD_TTL_MINUTES)) || 30; // sliding: pushed forward on every call while applied
-const MEU_HOLDS_SQL = `SELECT venue_id, amount_cents FROM meu_reward_hold
-                       WHERE member_ref = $1 AND partner_id = $2 AND status = 'held' AND expires_at > now()`;
+// TODO(Redemption Service): confirm it accepts these for me&u (IMPOS sends 'instore' / 'IMPOS').
+const MEU_WITHDRAWAL_TYPE = process.env.MEU_WITHDRAWAL_TYPE || 'online';
+const MEU_WITHDRAWAL_GATEWAY = process.env.MEU_WITHDRAWAL_GATEWAY || 'MEU';
+const meuDummyDeducted = new Map(); // MEU_DUMMY_MODE only: cents "redeemed" so far per externalId, so local tests see the balance drop
 
 const meuIsOurs = (d) => !!(d && d.metadata && d.metadata.externalRewardId === MEU_OFFER_ID);
+
+// me&u sends the current cart on every call, including our discount from an earlier apply.
+// That amount is what has already been deducted for this cart (apply-reward has no cart id to key on).
+const meuAppliedCents = (cart) =>
+  ((cart && cart.discounts) || []).filter(meuIsOurs).reduce((s, d) => s + (Number(d.amountInCents) || 0), 0);
 
 // What the reward can be applied against: items minus every discount that isn't ours (we recompute ours).
 // TODO(me&u): is items[].amountInCents a line total or a unit price? Read as a line total (the lower, safer reading).
@@ -960,63 +1045,74 @@ function meuApplicableCents(cart) {
   return Math.max(0, items - others);
 }
 
-// available = balance minus points held at OTHER venues of this partner; cap never exceeds the cart, so the total can't go below $0.
-function meuCalc(balanceCents, othersCents, applicableCents, partner) {
-  const available = Math.max(0, balanceCents - othersCents);
-  const cap = Math.min(available, applicableCents, partner.maxCents > 0 ? partner.maxCents : Infinity);
+// spendable = what's left on the balance + what this cart already had deducted; the cap never exceeds the cart, so the total can't go below $0.
+function meuCalc(balanceCents, appliedCents, applicableCents, partner) {
+  const spendable = balanceCents + appliedCents;
+  const cap = Math.min(spendable, applicableCents, partner.maxCents > 0 ? partner.maxCents : Infinity);
   let cause = null;
-  if (available <= 0) cause = { code: 'INSUFFICIENT_POINTS', message: 'Not enough points' };
+  if (spendable <= 0) cause = { code: 'INSUFFICIENT_POINTS', message: 'Not enough points' };
   else if (applicableCents <= 0) cause = { code: 'EMPTY_CART', message: 'Add items to use your cashback' };
   else if (cap < partner.minCents) cause = { code: 'BELOW_MINIMUM', message: `Minimum redemption is $${(partner.minCents / 100).toFixed(2)}` };
-  return { available, cap, cause };
+  return { spendable, cap, cause };
 }
 
-function meuOffer(calc, selected) {
+// selectedCents > 0 = shown as applied at that amount
+function meuOffer(calc, selectedCents) {
   const base = { id: MEU_OFFER_ID, type: 'PointShopOffer', name: 'Use your Aura cashback', description: 'Spend your cashback on this order' };
-  if (calc.cause) return { ...base, pointsPrice: calc.available, status: 'UNAVAILABLE_TO_REDEEM', nonRedeemableCause: calc.cause };
-  if (selected) return { ...base, pointsPrice: calc.cap, status: 'SELECTED_TO_REDEEM', discountAmountInCents: calc.cap };
+  if (calc.cause) return { ...base, pointsPrice: calc.spendable, status: 'UNAVAILABLE_TO_REDEEM', nonRedeemableCause: calc.cause };
+  if (selectedCents > 0) return { ...base, pointsPrice: selectedCents, status: 'SELECTED_TO_REDEEM', discountAmountInCents: selectedCents };
   return { ...base, pointsPrice: calc.cap, status: 'AVAILABLE_TO_REDEEM' };
 }
 
-const meuOthersCents = (rows, venueId) => rows.filter((r) => r.venue_id !== venueId).reduce((s, r) => s + r.amount_cents, 0);
-
-// apply=false: a plain view (read-only) -- unless me&u's cart already carries our discount, in which case we
-// re-cap the hold to the current cart and push its TTL forward. apply=true: the guest tapped Apply.
-// Both writing paths are serialized per member+partner, so two taps or devices can't over-book the balance.
-async function meuOfferView({ externalId, partner, venueId, balanceCents, cart, apply }) {
-  const applicable = meuApplicableCents(cart);
-  const inCart = !!(cart && (cart.discounts || []).some(meuIsOurs));
-
-  if (!apply && !inCart) {
-    const rows = await queryDatabase(MEU_HOLDS_SQL, [externalId, partner.partnerId]);
-    const calc = meuCalc(balanceCents, meuOthersCents(rows, venueId), applicable, partner);
-    return { available: calc.available, offer: calc.available > 0 ? meuOffer(calc, false) : null };
+// Deduct `cents` from the member's cashback. The Redemption Service `amount` is in cents (as in the IMPOS redeem).
+// MEU_DUMMY_MODE never calls the real service.
+async function meuRedeem(partnerId, externalId, cents) {
+  if (process.env.MEU_DUMMY_MODE === 'true') {
+    meuDummyDeducted.set(externalId, (meuDummyDeducted.get(externalId) || 0) + cents);
+    return { success: true };
   }
+  const transactionRef = `meu-${crypto.randomUUID()}`;
+  return callRedemptionService('redeem', 'POST', {
+    partnerId,
+    barcodeText: externalId,
+    orderId: transactionRef,
+    transactionRef,
+    amount: cents,
+    withdrawalType: MEU_WITHDRAWAL_TYPE,
+    withdrawalInstrument: 'Halo_Loyalty_Card',
+    tipAmount: 0,
+    withdrawalGateWay: MEU_WITHDRAWAL_GATEWAY,
+  });
+}
 
+// The guest tapped Apply: deduct whatever the cart doesn't already carry. One apply at a time per member+partner
+// (advisory lock), so a parallel tap reads the balance after this deduction. Nothing is written to our own tables.
+async function meuApply({ partner, externalId, cart }) {
+  const applied = meuAppliedCents(cart);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`${externalId}|${partner.partnerId}`]);
-    const { rows } = await client.query(MEU_HOLDS_SQL, [externalId, partner.partnerId]);
-    const calc = meuCalc(balanceCents, meuOthersCents(rows, venueId), applicable, partner);
 
-    if (!calc.cause) {
-      await client.query(
-        `INSERT INTO meu_reward_hold (member_ref, partner_id, venue_id, reward_id, amount_cents, expires_at)
-         VALUES ($1, $2, $3, $4, $5, now() + make_interval(mins => $6))
-         ON CONFLICT (member_ref, venue_id) WHERE status = 'held'
-         DO UPDATE SET partner_id = EXCLUDED.partner_id, amount_cents = EXCLUDED.amount_cents, expires_at = EXCLUDED.expires_at`,
-        [externalId, partner.partnerId, venueId, MEU_OFFER_ID, calc.cap, MEU_HOLD_TTL_MIN]
-      );
-    } else {
-      // no longer applicable (cart emptied, points gone, below minimum): tell me&u, and free the reservation
-      await client.query(
-        `UPDATE meu_reward_hold SET status = 'released' WHERE member_ref = $1 AND venue_id = $2 AND status = 'held'`,
-        [externalId, venueId]
-      );
+    const balance = await getMeuBalanceCents(partner.partnerId, externalId);
+    if (balance.error) {
+      await client.query('ROLLBACK');
+      return { error: balance.error };
     }
+    const calc = meuCalc(balance.cents, applied, meuApplicableCents(cart), partner);
+
+    // Only the part not already on the cart is deducted, so re-applying an unchanged cart deducts nothing.
+    if (!calc.cause && calc.cap > applied) {
+      const data = await meuRedeem(partner.partnerId, externalId, calc.cap - applied);
+      console.log('[meu] redeem', JSON.stringify({ partnerId: partner.partnerId, externalId, cents: calc.cap - applied, dummy: process.env.MEU_DUMMY_MODE === 'true', success: !!data.success, errorCode: data.errorCode || null, remainingBalance: data.remainingBalance }));
+      if (!data.success) {
+        if (applied > 0) calc.cap = applied; // the top-up failed; what was already deducted stays applied
+        else calc.cause = { code: 'REDEMPTION_FAILED', message: data.errorMessage || 'Could not use your cashback' };
+      }
+    }
+    console.log('[meu] apply', JSON.stringify({ partnerId: partner.partnerId, externalId, balanceCents: balance.cents, appliedCents: applied, capCents: calc.cap, cause: calc.cause ? calc.cause.code : null }));
     await client.query('COMMIT');
-    return { available: calc.available, offer: meuOffer(calc, !calc.cause) };
+    return { calc };
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     throw err;
@@ -1026,6 +1122,7 @@ async function meuOfferView({ externalId, partner, venueId, balanceCents, cart, 
 }
 
 // POST /meu/points-balance
+// Read-only. pointsBalance is what is left after any deduction; a cart that already carries our discount shows as SELECTED.
 // IN : { membership: { id, externalId (= referral_id), ... }, cart?, venueId, programId }
 // OUT: { status: 'ok', membership: { id, pointsBalance, rewards: [] | [PointShopOffer] } }
 app.post('/meu/points-balance', async (req, res) => {
@@ -1043,13 +1140,13 @@ app.post('/meu/points-balance', async (req, res) => {
     const balance = await getMeuBalanceCents(partner.partnerId, membership.externalId);
     if (balance.error) return res.status(404).json({ status: 'error', message: balance.error });
 
-    // pointsBalance = spendable points (balance minus points held at other venues); the offer is listed only if they have some.
-    const { available, offer } = await meuOfferView({
-      externalId: membership.externalId, partner, venueId, balanceCents: balance.cents, cart, apply: false,
-    });
+    const applied = meuAppliedCents(cart);
+    const calc = meuCalc(balance.cents, applied, meuApplicableCents(cart), partner);
+    // listed only if they have something to spend
+    const offer = calc.spendable > 0 ? meuOffer(calc, calc.cause ? 0 : Math.min(applied, calc.cap)) : null;
     return res.status(200).json({
       status: 'ok',
-      membership: { id: membership.id, pointsBalance: available, rewards: offer ? [offer] : [] },
+      membership: { id: membership.id, pointsBalance: balance.cents, rewards: offer ? [offer] : [] },
     });
   } catch (err) {
     console.error('Error in /meu/points-balance:', err.message);
@@ -1060,7 +1157,7 @@ app.post('/meu/points-balance', async (req, res) => {
 
 
 // POST /meu/apply-reward  ("Reward application", me&u -> Aura)
-// The guest tapped Apply on the cashback offer. We RESERVE points (a hold) -- nothing is deducted until checkout.
+// The guest tapped Apply on the cashback offer. We DEDUCT the cashback now (no hold); me&u decides about any refund.
 // IN : { membership?: { id, mobile, externalId }, cart: { venueId, items, discounts }, orderingType, rewards: { offer?, promoCode? } }
 //      headers: X-Api-Key, x-signature-sha256, x-program-id (the program is not in the body)
 // OUT: { status: 'ok', rewards: [PointShopOffer] } -- SELECTED_TO_REDEEM with discountAmountInCents, or UNAVAILABLE_TO_REDEEM with a cause
@@ -1082,16 +1179,155 @@ app.post('/meu/apply-reward', async (req, res) => {
     const partner = await getMeuPartner(cart.venueId, programId);
     if (!partner) return res.status(404).json({ status: 'error', message: 'Venue/program not configured for me&u' });
 
-    const balance = await getMeuBalanceCents(partner.partnerId, membership.externalId);
-    if (balance.error) return res.status(404).json({ status: 'error', message: balance.error });
+    const result = await meuApply({ partner, externalId: membership.externalId, cart });
+    if (result.error) return res.status(404).json({ status: 'error', message: result.error });
 
-    const { offer } = await meuOfferView({
-      externalId: membership.externalId, partner, venueId: cart.venueId, balanceCents: balance.cents, cart, apply: true,
-    });
-    return res.status(200).json({ status: 'ok', rewards: [offer] });
+    const { calc } = result;
+    return res.status(200).json({ status: 'ok', rewards: [meuOffer(calc, calc.cause ? 0 : calc.cap)] });
   } catch (err) {
     console.error('Error in /meu/apply-reward:', err.message);
     return res.status(500).json({ status: 'error', message: 'Internal Server Error' });
+  }
+});
+
+
+
+
+
+
+
+
+
+// ============================================================
+// me&u -- Webhook events (me&u -> Aura): cart-submitted, cart-claimed, marketing-consent-given
+// ============================================================
+// me&u's rule: respond immediately rather than once handling is finished. The only work we do
+// before replying is a handful of DB inserts -- no outbound calls -- so the reply stays fast in
+// practice. Rewards are NOT re-deducted here: /meu/apply-reward already deducted at apply time
+// (no holds), so this endpoint only records the cart against meu_transactions / meu_sales /
+// meu_payments (one header row, one row per item, one row per discount -- straight from the payload).
+
+// externalId -> referral_id, then membership.id -> meu_member_linking (this program), then mobile -> phone.
+async function meuResolveMember(client, membership, programId) {
+  if (!membership) return null;
+  let r;
+  if (membership.externalId) {
+    r = await client.query(`SELECT member_id, referral_id FROM aura_customer WHERE referral_id = $1`, [membership.externalId]);
+    if (r.rowCount) return r.rows[0];
+  }
+  if (membership.id) {
+    r = await client.query(
+      `SELECT c.member_id, c.referral_id FROM meu_member_linking l JOIN aura_customer c USING (member_id)
+       WHERE l.membership_id = $1 AND l.program_id = $2`,
+      [membership.id, programId]
+    );
+    if (r.rowCount) return r.rows[0];
+  }
+  if (membership.mobile) {
+    r = await client.query(`SELECT member_id, referral_id FROM aura_customer WHERE phone = $1`, [membership.mobile]);
+    if (r.rowCount) return r.rows[0];
+  }
+  return null;
+}
+
+// Stores the cart straight into the three tables -- one meu_transactions header row, one meu_sales
+// row per item, one meu_payments row per discount -- exactly as given, no merging with any earlier
+// event for the same cart.id (see the note where this is called: a retry or a cart-claimed that
+// follows cart-submitted for the same cart each add their own rows, not update one).
+async function meuStoreCartEvent(payload, eventType) {
+  const { programId, programName, membership, venue, cart } = payload || {};
+  if (!programId || !venue || !venue.id || !cart || !cart.id) {
+    throw Object.assign(new Error('programId, venue.id and cart.id are required'), { status: 400 });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(
+      `INSERT INTO meu_transactions
+         (program_id, program_name, membership_id, membership_external_id, membership_program_id, membership_mobile, venue_id, cart_id, submitted_at, event_type)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [programId, programName || null, membership ? membership.id : null, membership ? membership.externalId : null,
+       membership ? membership.programId : null, membership ? membership.mobile : null, venue.id, cart.id,
+       cart.submittedAt ? new Date(cart.submittedAt) : null, eventType]
+    );
+
+    for (const item of cart.items || []) {
+      await client.query(
+        `INSERT INTO meu_sales (cart_id, item_id, item_name, pos_id, amount_in_cents, quantity)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [cart.id, item.id, item.name || null, (item.metadata && item.metadata.posId) || null, item.amountInCents, item.quantity]
+      );
+    }
+
+    for (const discount of cart.discounts || []) {
+      const meta = discount.metadata || {};
+      await client.query(
+        `INSERT INTO meu_payments (cart_id, discount_type, discount_name, amount_in_cents, is_internal, external_reward_id, reward_type, promo_code)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        [cart.id, discount.type, discount.name, discount.amountInCents, !!discount.isInternal,
+         meta.externalRewardId || null, meta.rewardType || null, meta.promoCode || null]
+      );
+    }
+
+    await client.query('COMMIT');
+    console.log('[meu] webhook cart event stored', JSON.stringify({ cartId: cart.id, items: (cart.items || []).length, discounts: (cart.discounts || []).length }));
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+// Best-effort only: cart-claimed always carries a full membership, so this backfills
+// meu_member_linking's membership id when we can resolve the Aura member -- the other place
+// (besides /auto-linking) that can learn me&u's membership id. Never throws; a failure here must
+// not fail the webhook, since the cart itself is already stored by the time this runs.
+async function meuBackfillLinkFromClaim(programId, membership) {
+  if (!membership || !membership.id) return;
+  const client = await pool.connect();
+  try {
+    const member = await meuResolveMember(client, membership, programId);
+    if (member) {
+      await client.query(
+        `INSERT INTO meu_member_linking (member_id, external_id, program_id, membership_id)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (program_id, member_id) DO UPDATE SET membership_id = EXCLUDED.membership_id`,
+        [member.member_id, member.referral_id, programId, membership.id]
+      );
+    }
+  } catch (err) {
+    console.error('me&u link backfill from cart-claimed failed:', err.message);
+  } finally {
+    client.release();
+  }
+}
+
+// POST /meu/webhooks
+// IN : { type: 'cart-submitted' | 'cart-claimed' | 'marketing-consent-given', payload: {...} }
+app.post('/meu/webhooks', async (req, res) => {
+  if (!meuAuthOk(req)) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+
+  const { type, payload } = req.body || {};
+  try {
+    if (type === 'cart-submitted' || type === 'cart-claimed') {
+      await meuStoreCartEvent(payload, type);
+      if (type === 'cart-claimed') await meuBackfillLinkFromClaim(payload && payload.programId, payload && payload.membership);
+      return res.status(200).json({ status: 'ok' });
+    }
+    if (type === 'marketing-consent-given') {
+      // No column on aura_customer to store consent yet -- logged only until that's decided.
+      console.log('[meu] webhook marketing-consent-given', JSON.stringify(payload));
+      return res.status(200).json({ status: 'ok' });
+    }
+    console.log('[meu] webhook: unknown event type', type); // ack unknown/future types rather than erroring
+    return res.status(200).json({ status: 'ok' });
+  } catch (err) {
+    console.error('Error in /meu/webhooks:', err.message);
+    await logMeuLinkStatus({ eventType: 'MEU_WEBHOOK', status: 'ERROR', programId: payload && payload.programId, message: `${type}: ${err.message}` });
+    return res.status(err.status || 500).json({ status: 'error', message: err.status ? err.message : 'Internal Server Error' });
   }
 });
 
