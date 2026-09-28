@@ -748,6 +748,27 @@ async function storeErrorLog({
   }
 }
 
+// Renamed from the pasted storeErrorLog to avoid overwriting the function above (same name, different
+// table -- withdrawal_error_logs vs meu_log). Logic is exactly as given, just the name changed.
+// The one place for any me&u-side error (auto-linking, membership-link, points-balance, apply-reward, webhooks).
+async function storeMeuLog({ programId, membershipId = null, eventType, errorMessage }) {
+  const query = `
+    INSERT INTO public.meu_log (program_id, membership_id, event_type, error_message, created_at)
+    VALUES ($1, $2, $3, $4, NOW())
+    RETURNING id;
+  `;
+
+  const values = [programId, membershipId, eventType, errorMessage];
+
+  try {
+    const result = await pool.query(query, values);
+    console.log("Error logged with ID:", result.rows[0].id);
+    return result.rows[0].id;
+  } catch (err) {
+    console.error("Failed to log error:", err.message);
+  }
+}
+
 
 
 // ============================================================
@@ -784,31 +805,28 @@ async function logMeuLinkStatus({ eventType, status, programId, externalId, memb
 
 // Saves me&u's membership id against the Aura member in meu_member_linking, using the memberId
 // passed straight from the payload -- no lookup against aura_customer or any other table.
+// partnerId is taken from the request payload as sent, not cross-checked against meu_partner_program_config.
+// A call that omits it keeps whatever partner_id is already on the row, instead of clearing it.
 // Never fails the request: me&u has already created the membership, so a DB problem only raises an alert.
-async function meuSaveLink(programId, externalId, membershipId, memberId) {
+async function meuSaveLink(programId, externalId, membershipId, memberId, partnerId) {
   if (!externalId || !membershipId || !memberId) {
     return console.log("me&u link not saved: payload.memberId, payload.externalId or the returned membership id is missing");
   }
   try {
     const rows = await queryDatabase(
-      `INSERT INTO meu_member_linking (member_id, external_id, program_id, membership_id)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (program_id, member_id) DO UPDATE SET membership_id = EXCLUDED.membership_id
+      `INSERT INTO meu_member_linking (member_id, external_id, program_id, membership_id, partner_id)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (program_id, member_id) DO UPDATE SET
+         membership_id = EXCLUDED.membership_id,
+         partner_id = COALESCE(EXCLUDED.partner_id, meu_member_linking.partner_id)
        RETURNING member_id`,
-      [memberId, externalId, programId, membershipId]
+      [memberId, externalId, programId, membershipId, partnerId || null]
     );
     console.log("[meu] link saved", JSON.stringify({ programId, externalId, membershipId, memberId: rows[0].member_id }));
     await logMeuLinkStatus({ eventType: "MEU_AUTO_LINKING", status: "SAVED", programId, externalId, membershipId, memberId: rows[0].member_id });
   } catch (err) {
     console.error("me&u link not saved:", err.message);
-    await storeErrorLog({
-      requestPayload: JSON.stringify({ programId, externalId, membershipId, memberId }),
-      memberId,
-      eventType: "MEU_AUTO_LINKING",
-      errorType: err.name,
-      errorMessage: err.message,
-    });
-    await logMeuLinkStatus({ eventType: "MEU_AUTO_LINKING", status: "ERROR", programId, externalId, membershipId, memberId, message: err.message });
+    await storeMeuLog({ programId, membershipId, eventType: "MEU_AUTO_LINKING", errorMessage: err.message });
   }
 }
 
@@ -822,13 +840,17 @@ app.post("/auto-linking", async (req, res) => {
   if (!programId || !payload) {
     return res.status(400).json({ error: "programId and payload are required" });
   }
+  if (!payload.venueId) {
+    return res.status(400).json({ error: "payload.venueId is required" });
+  }
 
   try {
     const configured = await queryDatabase(
-      `SELECT 1 FROM meu_partner_program_config WHERE program_id = $1 AND active = true LIMIT 1`,
-      [programId]
+      `SELECT partner_id FROM meu_partner_program_config WHERE program_id = $1 AND venue_id = $2 AND active = true LIMIT 1`,
+      [programId, payload.venueId]
     );
     if (!configured.length) return res.status(404).json({ error: "Program not configured for me&u" });
+    const partnerId = configured[0].partner_id; // sourced from config, never trusted from the request payload
 
     let status, data;
     if (process.env.MEU_DUMMY_MODE === "true") {
@@ -853,10 +875,11 @@ app.post("/auto-linking", async (req, res) => {
       data = response.data;
     }
 
-    await meuSaveLink(programId, payload.externalId, data && (data.id || (data.body && data.body.id)), payload.memberId);
+    await meuSaveLink(programId, payload.externalId, data && (data.id || (data.body && data.body.id)), payload.memberId, partnerId);
     return res.status(status).json(data);
   } catch (error) {
     console.error("Error in /auto-linking:", error.response ? error.response.data : error.message);
+    await storeMeuLog({ programId, eventType: "MEU_AUTO_LINKING", errorMessage: error.response ? JSON.stringify(error.response.data) : error.message });
     return res.status(error.response ? error.response.status : 500).json({
       error: "Failed to auto-link membership",
       detail: error.response ? error.response.data : error.message,
@@ -915,6 +938,10 @@ app.post('/meu/membership-link', async (req, res) => {
           return res.status(200).json({ membershipId: linked.rows[0].external_id });
         }
       }
+    } else {
+      status = 'error';
+      message = 'programId is required';
+      return res.status(400).json({ message });
     }
 
     // Search for an existing membership created outside me&u (same lookup)
@@ -943,7 +970,7 @@ app.post('/meu/membership-link', async (req, res) => {
     console.error('Error in /meu/membership-link:', err);
     status = 'error';
     message = err.message;
-    await logMeuLinkStatus({ eventType: 'MEU_MEMBERSHIP_LINKING', status: 'ERROR', programId, externalId: externalMembershipId, message: err.message });
+    await storeMeuLog({ programId, membershipId: externalMembershipId, eventType: 'MEU_MEMBERSHIP_LINKING', errorMessage: err.message });
     return res.status(500).json({ message });
   } finally {
     const insertLogQuery = `
@@ -958,6 +985,9 @@ app.post('/meu/membership-link', async (req, res) => {
     if (client) client.release();
   }
 });
+
+
+
 
 // ---- me&u "Displaying points balance and rewards" (me&u -> Aura) ----
 // Hot: me&u calls this on every venue home / cart view and every cart change, so it stays thin --
@@ -1150,6 +1180,7 @@ app.post('/meu/points-balance', async (req, res) => {
     });
   } catch (err) {
     console.error('Error in /meu/points-balance:', err.message);
+    await storeMeuLog({ programId: (req.body && req.body.programId) || 'unknown', membershipId: req.body && req.body.membership && req.body.membership.id, eventType: 'MEU_POINTS_BALANCE', errorMessage: err.message });
     return res.status(500).json({ status: 'error', message: 'Internal Server Error' });
   }
 });
@@ -1186,6 +1217,7 @@ app.post('/meu/apply-reward', async (req, res) => {
     return res.status(200).json({ status: 'ok', rewards: [meuOffer(calc, calc.cause ? 0 : calc.cap)] });
   } catch (err) {
     console.error('Error in /meu/apply-reward:', err.message);
+    await storeMeuLog({ programId: req.get('x-program-id') || 'unknown', membershipId: req.body && req.body.membership && req.body.membership.id, eventType: 'MEU_APPLY_REWARD', errorMessage: err.message });
     return res.status(500).json({ status: 'error', message: 'Internal Server Error' });
   }
 });
@@ -1240,39 +1272,42 @@ async function meuStoreCartEvent(payload, eventType) {
     throw Object.assign(new Error('programId, venue.id and cart.id are required'), { status: 400 });
   }
 
+  const transactionId = crypto.randomUUID(); // meu_transactions' own PK -- one per event, NOT cart.id (two events can share a cart.id)
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
     await client.query(
       `INSERT INTO meu_transactions
-         (program_id, program_name, membership_id, membership_external_id, membership_program_id, membership_mobile, venue_id, cart_id, submitted_at, event_type)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-      [programId, programName || null, membership ? membership.id : null, membership ? membership.externalId : null,
+         (transaction_id, program_id, program_name, membership_id, membership_external_id, membership_program_id, membership_mobile, venue_id, trx_id, submitted_at, event_type)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      [transactionId, programId, programName || null, membership ? membership.id : null, membership ? membership.externalId : null,
        membership ? membership.programId : null, membership ? membership.mobile : null, venue.id, cart.id,
        cart.submittedAt ? new Date(cart.submittedAt) : null, eventType]
     );
 
+    // meu_sales / meu_payments link to THIS transaction row (transactionId), not to cart.id -- cart.id can be
+    // shared by two rows (cart-submitted + cart-claimed), so linking by it would be ambiguous.
     for (const item of cart.items || []) {
       await client.query(
-        `INSERT INTO meu_sales (cart_id, item_id, item_name, pos_id, amount_in_cents, quantity)
+        `INSERT INTO meu_sales (trx_id, item_id, item_name, pos_id, amount_in_cents, quantity)
          VALUES ($1,$2,$3,$4,$5,$6)`,
-        [cart.id, item.id, item.name || null, (item.metadata && item.metadata.posId) || null, item.amountInCents, item.quantity]
+        [transactionId, item.id, item.name || null, (item.metadata && item.metadata.posId) || null, item.amountInCents, item.quantity]
       );
     }
 
     for (const discount of cart.discounts || []) {
       const meta = discount.metadata || {};
       await client.query(
-        `INSERT INTO meu_payments (cart_id, discount_type, discount_name, amount_in_cents, is_internal, external_reward_id, reward_type, promo_code)
+        `INSERT INTO meu_payments (trx_id, discount_type, discount_name, amount_in_cents, is_internal, external_reward_id, reward_type, promo_code)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-        [cart.id, discount.type, discount.name, discount.amountInCents, !!discount.isInternal,
+        [transactionId, discount.type, discount.name, discount.amountInCents, !!discount.isInternal,
          meta.externalRewardId || null, meta.rewardType || null, meta.promoCode || null]
       );
     }
 
     await client.query('COMMIT');
-    console.log('[meu] webhook cart event stored', JSON.stringify({ cartId: cart.id, items: (cart.items || []).length, discounts: (cart.discounts || []).length }));
+    console.log('[meu] webhook cart event stored', JSON.stringify({ transactionId, cartId: cart.id, items: (cart.items || []).length, discounts: (cart.discounts || []).length }));
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     throw err;
@@ -1300,6 +1335,7 @@ async function meuBackfillLinkFromClaim(programId, membership) {
     }
   } catch (err) {
     console.error('me&u link backfill from cart-claimed failed:', err.message);
+    await storeMeuLog({ programId: programId || 'unknown', membershipId: membership && membership.id, eventType: 'MEU_WEBHOOK_LINK_BACKFILL', errorMessage: err.message });
   } finally {
     client.release();
   }
@@ -1326,7 +1362,7 @@ app.post('/meu/webhooks', async (req, res) => {
     return res.status(200).json({ status: 'ok' });
   } catch (err) {
     console.error('Error in /meu/webhooks:', err.message);
-    await logMeuLinkStatus({ eventType: 'MEU_WEBHOOK', status: 'ERROR', programId: payload && payload.programId, message: `${type}: ${err.message}` });
+    await storeMeuLog({ programId: (payload && payload.programId) || 'unknown', membershipId: payload && payload.membership && payload.membership.id, eventType: `MEU_WEBHOOK_${(type || 'UNKNOWN').toUpperCase().replace(/-/g, '_')}`, errorMessage: err.message });
     return res.status(err.status || 500).json({ status: 'error', message: err.status ? err.message : 'Internal Server Error' });
   }
 });
