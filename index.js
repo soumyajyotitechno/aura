@@ -12,13 +12,13 @@ GROUP_ID = 5
 // API hit log: one line per request (method, path, status, ms) for EVERY route. me&u routes also print the request and
 // response bodies, with mobile/email masked; headers and query strings are never logged. MEU_LOG_BODIES=false turns bodies off.
 const LOG_BODIES = process.env.MEU_LOG_BODIES !== 'false';
-const maskPii = (k, v) => (/^(mobile|phone|email)$/i.test(k) && typeof v === 'string' ? v.replace(/.(?=.{3})/g, '*') : v);
+const maskPii = (k, v) => (String(k).match(/^(mobile|phone|email)$/i) && typeof v === 'string' ? v.replace(/.(?=.{3})/g, '*') : v);
 app.use((req, res, next) => {
   const start = Date.now();
   const json = res.json.bind(res);
   res.json = (body) => { // logged here, before the reply goes out, so Lambda can't freeze before the line is written
     console.log(`[API] ${req.method} ${req.path} -> ${res.statusCode} (${Date.now() - start}ms)`);
-    if (LOG_BODIES && /^\/(meu\/|auto-linking)/.test(req.path)) {
+    if (LOG_BODIES && req.path.match(/^\/(meu\/|auto-linking)/)) {
       console.log('[API]   in :', JSON.stringify(req.body, maskPii));
       console.log('[API]   out:', JSON.stringify(body, maskPii));
     }
@@ -1003,29 +1003,32 @@ function meuAuthOk(req) {
   return safeEqual(req.get('x-api-key'), API_KEY);
 }
 
-// venue + program -> Aura partner + its redemption limits. Config rarely changes, so keep hits in
-// Lambda memory for 5 min (a deactivated venue can linger that long). Misses aren't cached.
+// venue -> Aura partner + its redemption limits (+ the program the venue is configured under). The reward
+// application call carries no program id, so the venue alone picks the active config row (newest if there
+// were ever several). Config rarely changes, so keep hits in Lambda memory for 5 min (a deactivated venue
+// can linger that long). Misses aren't cached.
 const meuPartnerCache = new Map();
-async function getMeuPartner(venueId, programId) {
-  const key = `${venueId}|${programId}`;
-  const hit = meuPartnerCache.get(key);
+async function getMeuPartner(venueId) {
+  const hit = meuPartnerCache.get(venueId);
   if (hit && hit.exp > Date.now()) return hit.partner;
 
   const rows = await queryDatabase(
-    `SELECT c.partner_id, r.redemption_min_withdrawal AS min_dollars, r.redemption_max_withdrawal AS max_dollars
+    `SELECT c.partner_id, c.program_id, r.redemption_min_withdrawal AS min_dollars, r.redemption_max_withdrawal AS max_dollars
      FROM meu_partner_program_config c
      LEFT JOIN partner_redemption_rule r ON r.partner_id = c.partner_id AND r.is_active = true
-     WHERE c.venue_id = $1 AND c.program_id = $2 AND c.active = true
+     WHERE c.venue_id = $1 AND c.active = true
+     ORDER BY c.id DESC
      LIMIT 1`,
-    [venueId, programId]
+    [venueId]
   );
   if (!rows.length) return null;
   const partner = {
     partnerId: rows[0].partner_id,
+    programId: rows[0].program_id,
     minCents: Math.round(Number(rows[0].min_dollars || 0) * 100),
     maxCents: Math.round(Number(rows[0].max_dollars || 0) * 100), // 0 = no maximum
   };
-  meuPartnerCache.set(key, { partner, exp: Date.now() + 5 * 60 * 1000 });
+  meuPartnerCache.set(venueId, { partner, exp: Date.now() + 5 * 60 * 1000 });
   return partner;
 }
 
@@ -1038,7 +1041,13 @@ async function getMeuBalanceCents(partnerId, externalId) {
     const m = /^dummy-(\d+(?:\.\d+)?)$/.exec(externalId);
     data = { success: true, valid: true, balance: (m ? Number(m[1]) : 12.34) - (meuDummyDeducted.get(externalId) || 0) / 100 };
   } else {
-    data = await callRedemptionService(`enquiry?partnerId=${partnerId}&barcodeText=${encodeURIComponent(externalId)}`);
+    // Balance from the me&u `meu/points` URL (same one /meu/points-balance uses), not `enquiry`.
+    try {
+      const response = await axios.get(`https://jqzlxs0nr9.execute-api.ap-southeast-2.amazonaws.com/v1/meu/points?partnerId=${encodeURIComponent(partnerId)}&externalId=${encodeURIComponent(externalId)}`);
+      data = response.data;
+    } catch (err) {
+      data = err.response ? err.response.data : { success: false, errorMessage: err.message };
+    }
   }
   if (!data.success) return { error: data.errorMessage || 'Member not found' };
   return { cents: data.valid ? Math.round(Number(data.balance || 0) * 100) : 0 }; // invalid (inactive) member = 0
@@ -1063,11 +1072,12 @@ const meuAppliedCents = (cart) =>
   ((cart && cart.discounts) || []).filter(meuIsOurs).reduce((s, d) => s + (Number(d.amountInCents) || 0), 0);
 
 // What the reward can be applied against: items minus every discount that isn't ours (we recompute ours).
+// Only discounts with isInternal === false count; internal ones' amountInCents is not taken.
 // TODO(me&u): is items[].amountInCents a line total or a unit price? Read as a line total (the lower, safer reading).
 function meuApplicableCents(cart) {
   if (!cart) return 0;
   const items = (cart.items || []).reduce((s, i) => s + (Number(i.amountInCents) || 0), 0);
-  const others = (cart.discounts || []).filter((d) => !meuIsOurs(d)).reduce((s, d) => s + (Number(d.amountInCents) || 0), 0);
+  const others = (cart.discounts || []).filter((d) => !meuIsOurs(d) && d.isInternal === false).reduce((s, d) => s + (Number(d.amountInCents) || 0), 0);
   return Math.max(0, items - others);
 }
 
@@ -1097,12 +1107,12 @@ async function meuRedeem(partnerId, externalId, cents) {
     meuDummyDeducted.set(externalId, (meuDummyDeducted.get(externalId) || 0) + cents);
     return { success: true };
   }
-  const transactionRef = `meu-${crypto.randomUUID()}`;
+  // orderId and transactionRef are each a plain UUID; barcodeText is the externalId only; no eventTimestamp is sent.
   return callRedemptionService('redeem', 'POST', {
     partnerId,
     barcodeText: externalId,
-    orderId: transactionRef,
-    transactionRef,
+    orderId: crypto.randomUUID(),
+    transactionRef: crypto.randomUUID(),
     amount: cents,
     withdrawalType: MEU_WITHDRAWAL_TYPE,
     withdrawalInstrument: 'Halo_Loyalty_Card',
@@ -1189,21 +1199,17 @@ app.post('/meu/points-balance', async (req, res) => {
     const minCents = Math.round(Number(configRows[0].min_dollars || 0) * 100);
     const maxCents = Math.round(Number(configRows[0].max_dollars || 0) * 100); // 0 = no maximum
 
-    // Balance, straight from the me&u `meu/points` URL -- no callRedemptionService, no other helper.
+    // Balance, straight from the me&u `meu/points` URL -- no callRedemptionService, no other helper, no dummy mode.
+    // Used raw, exactly as the service returns it: no unit conversion.
     let pointsData;
-    if (process.env.MEU_DUMMY_MODE === 'true') {
-      const m = /^dummy-(\d+(?:\.\d+)?)$/.exec(membership.externalId);
-      pointsData = { success: true, valid: true, balance: (m ? Number(m[1]) : 12.34) - (meuDummyDeducted.get(membership.externalId) || 0) / 100 };
-    } else {
-      try {
-        const response = await axios.get(`https://jqzlxs0nr9.execute-api.ap-southeast-2.amazonaws.com/v1/meu/points?partnerId=${partnerId}&externalId=${encodeURIComponent(membership.externalId)}`);
-        pointsData = response.data;
-      } catch (err) {
-        pointsData = err.response ? err.response.data : { success: false, errorMessage: err.message };
-      }
+    try {
+      const response = await axios.get(`https://jqzlxs0nr9.execute-api.ap-southeast-2.amazonaws.com/v1/meu/points?partnerId=${partnerId}&externalId=${encodeURIComponent(membership.externalId)}`);
+      pointsData = response.data;
+    } catch (err) {
+      pointsData = err.response ? err.response.data : { success: false, errorMessage: err.message };
     }
     if (!pointsData.success) return res.status(404).json({ status: 'error', message: pointsData.errorMessage || 'Member not found' });
-    const balanceCents = pointsData.valid ? Math.round(Number(pointsData.balance || 0) * 100) : 0;
+    const balance = pointsData.valid ? Number(pointsData.balance) || 0 : 0;
 
     // Cashback offer calc -- own copy, not meuCalc/meuOffer/meuApplicableCents/meuAppliedCents.
     const isOurs = (d) => !!(d && d.metadata && d.metadata.externalRewardId === MEU_OFFER_ID);
@@ -1212,7 +1218,7 @@ app.post('/meu/points-balance', async (req, res) => {
     const othersCents = ((cart && cart.discounts) || []).filter((d) => !isOurs(d)).reduce((s, d) => s + (Number(d.amountInCents) || 0), 0);
     const applicableCents = Math.max(0, itemsCents - othersCents);
 
-    const spendableCents = balanceCents + appliedCents;
+    const spendableCents = balance + appliedCents;
     const capCents = Math.min(spendableCents, applicableCents, maxCents > 0 ? maxCents : Infinity);
     let nonRedeemableCause = null;
     if (spendableCents <= 0) nonRedeemableCause = { code: 'INSUFFICIENT_POINTS', message: 'Not enough points' };
@@ -1232,7 +1238,7 @@ app.post('/meu/points-balance', async (req, res) => {
       }
     }
 
-    return res.status(200).json({ status: 'ok', membership: { id: membership.id, pointsBalance: balanceCents, rewards } });
+    return res.status(200).json({ status: 'ok', membership: { id: membership.id, pointsBalance: balance, rewards } });
   } catch (err) {
     console.error('Error in /meu/points-balance:', err.message);
     await storeMeuLog({ programId: (req.body && req.body.programId) || 'unknown', membershipId: req.body && req.body.membership && req.body.membership.id, eventType: 'MEU_POINTS_BALANCE', errorMessage: err.message });
@@ -1253,15 +1259,15 @@ app.post('/meu/points-balance', async (req, res) => {
 // POST /meu/apply-reward  ("Reward application", me&u -> Aura)
 // The guest tapped Apply on the cashback offer. We DEDUCT the cashback now (no hold); me&u decides about any refund.
 // IN : { membership?: { id, mobile, externalId }, cart: { venueId, items, discounts }, orderingType, rewards: { offer?, promoCode? } }
-//      headers: X-Api-Key, x-signature-sha256, x-program-id (the program is not in the body)
+//      The request carries no program id: the partner is found from cart.venueId alone.
 // OUT: { status: 'ok', rewards: [PointShopOffer] } -- SELECTED_TO_REDEEM with discountAmountInCents, or UNAVAILABLE_TO_REDEEM with a cause
 app.post('/meu/apply-reward', async (req, res) => {
+  let programId = 'unknown'; // only for the error log; set from the venue's config row once it is found
   try {
 
     const { membership, cart, rewards } = req.body || {};
-    const programId = req.get('x-program-id');
-    if (!cart || !cart.venueId || !programId) {
-      return res.status(400).json({ status: 'error', message: 'cart.venueId and the x-program-id header are required' });
+    if (!cart || !cart.venueId) {
+      return res.status(400).json({ status: 'error', message: 'cart.venueId is required' });
     }
 
     // Guests without a membership, other offers and promo codes are out of scope: nothing to apply.
@@ -1269,8 +1275,9 @@ app.post('/meu/apply-reward', async (req, res) => {
       return res.status(200).json({ status: 'ok', rewards: [] });
     }
 
-    const partner = await getMeuPartner(cart.venueId, programId);
-    if (!partner) return res.status(404).json({ status: 'error', message: 'Venue/program not configured for me&u' });
+    const partner = await getMeuPartner(cart.venueId);
+    if (!partner) return res.status(404).json({ status: 'error', message: 'Venue not configured for me&u' });
+    programId = partner.programId;
 
     const result = await meuApply({ partner, externalId: membership.externalId, cart });
     if (result.error) return res.status(404).json({ status: 'error', message: result.error });
@@ -1279,7 +1286,7 @@ app.post('/meu/apply-reward', async (req, res) => {
     return res.status(200).json({ status: 'ok', rewards: [meuOffer(calc, calc.cause ? 0 : calc.cap)] });
   } catch (err) {
     console.error('Error in /meu/apply-reward:', err.message);
-    await storeMeuLog({ programId: req.get('x-program-id') || 'unknown', membershipId: req.body && req.body.membership && req.body.membership.id, eventType: 'MEU_APPLY_REWARD', errorMessage: err.message });
+    await storeMeuLog({ programId, membershipId: req.body && req.body.membership && req.body.membership.id, eventType: 'MEU_APPLY_REWARD', errorMessage: err.message });
     return res.status(500).json({ status: 'error', message: 'Internal Server Error' });
   }
 });
@@ -1347,7 +1354,7 @@ async function meuStoreCartEvent(payload, eventType) {
     // safe prefix there is nowhere to insert at all. Table names can't be parameterized like values,
     // so the prefix is validated (letters/digits/underscore only) before it's ever put into SQL text.
     const partnerRows = await client.query(
-      `SELECT p.table_prefix, p.partner_id
+      `SELECT p.table_prefix, p.partner_id, c.site_id
        FROM meu_partner_program_config c
        JOIN aura_partner p ON p.partner_id = c.partner_id
        WHERE c.venue_id = $1 AND c.program_id = $2 AND c.active = true
@@ -1356,7 +1363,7 @@ async function meuStoreCartEvent(payload, eventType) {
     );
     const prefix = partnerRows.rows[0] && partnerRows.rows[0].table_prefix;
     const partnerId = partnerRows.rows[0] && partnerRows.rows[0].partner_id;
-    if (!prefix || !/^[a-z][a-z0-9_]*$/i.test(prefix)) {
+    if (!prefix || !prefix.match(/^[a-z][a-z0-9_]*$/i)) {
       await client.query('ROLLBACK');
       console.log('[meu] webhook cart event skipped -- no partner/table_prefix resolved', JSON.stringify({ cartId: cart.id, venueId: venue.id, programId }));
       return { skipped: true };
@@ -1368,13 +1375,18 @@ async function meuStoreCartEvent(payload, eventType) {
     // Gate: only store if this me&u membership is already linked to a known Aura member.
     // Looked up by membership.id -> meu_member_linking.member_id; no membership, no match, or no
     // member_id on that row all mean skip -- nothing goes into the partner's transaction tables.
+    // externalId is NOT taken from the payload -- it comes from this same meu_member_linking row.
     let memberId = null;
+    let externalId = null;
     if (membership && membership.id) {
       const linked = await client.query(
-        `SELECT member_id FROM meu_member_linking WHERE membership_id = $1 AND program_id = $2 LIMIT 1`,
+        `SELECT member_id, external_id FROM meu_member_linking WHERE membership_id = $1 AND program_id = $2 LIMIT 1`,
         [membership.id, programId]
       );
-      if (linked.rowCount && linked.rows[0].member_id) memberId = linked.rows[0].member_id;
+      if (linked.rowCount && linked.rows[0].member_id) {
+        memberId = linked.rows[0].member_id;
+        externalId = linked.rows[0].external_id || null;
+      }
     }
     if (!memberId) {
       await client.query('ROLLBACK');
@@ -1382,38 +1394,30 @@ async function meuStoreCartEvent(payload, eventType) {
       return { skipped: true };
     }
 
+    // check_total = sum of every cart item's amountInCents (in cents), written to both transaction tables.
+    const checkTotal = (cart.items || []).reduce((s, i) => s + (Number(i.amountInCents) || 0), 0);
+
+    // Insert once: a repeat of the same cart.id never updates the existing transaction row.
     await client.query(
       `INSERT INTO ${transactionsTable}
-         (trx_id, program_id, program_name, membership_id, membership_external_id, membership_program_id, membership_mobile, venue_id, submitted_at, event_type)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-       ON CONFLICT (trx_id) DO UPDATE SET
-         program_id = EXCLUDED.program_id,
-         program_name = EXCLUDED.program_name,
-         membership_id = COALESCE(EXCLUDED.membership_id, ${transactionsTable}.membership_id),
-         membership_external_id = COALESCE(EXCLUDED.membership_external_id, ${transactionsTable}.membership_external_id),
-         membership_program_id = COALESCE(EXCLUDED.membership_program_id, ${transactionsTable}.membership_program_id),
-         membership_mobile = COALESCE(EXCLUDED.membership_mobile, ${transactionsTable}.membership_mobile),
-         venue_id = EXCLUDED.venue_id,
-         submitted_at = EXCLUDED.submitted_at,
-         event_type = EXCLUDED.event_type`,
-      [transactionId, programId, programName || null, membership ? membership.id : null, membership ? membership.externalId : null,
+         (trx_id, program_id, program_name, membership_id, membership_external_id, membership_program_id, membership_mobile, venue_id, submitted_at, event_type, check_total)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+       ON CONFLICT (trx_id) DO NOTHING`,
+      [transactionId, programId, programName || null, membership ? membership.id : null, externalId,
        membership ? membership.programId : null, membership ? membership.mobile : null, venue.id,
-       cart.submittedAt ? new Date(cart.submittedAt) : null, eventType]
+       cart.submittedAt ? new Date(cart.submittedAt) : null, eventType, checkTotal]
     );
 
-    // meu_<prefix>_sales / _payments link to THIS transaction row (transactionId), not to cart.id --
-    // cart.id can be shared by two rows (cart-submitted + cart-claimed), so linking by it would be
-    // ambiguous. The transactions row is upserted above, but a retry would otherwise re-run these
-    // loops and pile up duplicate item/discount rows -- so each set is only written once per trx_id.
-    const hasSales = await client.query(`SELECT 1 FROM ${salesTable} WHERE trx_id = $1 LIMIT 1`, [transactionId]);
-    if (!hasSales.rowCount) {
-      for (const item of cart.items || []) {
-        await client.query(
-          `INSERT INTO ${salesTable} (trx_id, item_id, item_name, pos_id, amount_in_cents, quantity)
-           VALUES ($1,$2,$3,$4,$5,$6)`,
-          [transactionId, item.id, item.name || null, (item.metadata && item.metadata.posId) || null, item.amountInCents, item.quantity]
-        );
-      }
+    // One sales row per product in the cart. Each item is inserted only if that item_id isn't already
+    // stored for this trx_id, so a repeat adds nothing twice but a product missing from an earlier hit is still added.
+    for (const item of cart.items || []) {
+      const hasItem = await client.query(`SELECT 1 FROM ${salesTable} WHERE trx_id = $1 AND item_id = $2 LIMIT 1`, [transactionId, item.id]);
+      if (hasItem.rowCount) continue;
+      await client.query(
+        `INSERT INTO ${salesTable} (trx_id, item_id, item_name, pos_id, amount_in_cents, quantity, created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,NOW(),NOW())`,
+        [transactionId, item.id, item.name || null, (item.metadata && item.metadata.posId) || null, item.amountInCents, item.quantity]
+      );
     }
 
     const hasPayments = await client.query(`SELECT 1 FROM ${paymentsTable} WHERE trx_id = $1 LIMIT 1`, [transactionId]);
@@ -1421,8 +1425,8 @@ async function meuStoreCartEvent(payload, eventType) {
       for (const discount of cart.discounts || []) {
         const meta = discount.metadata || {};
         await client.query(
-          `INSERT INTO ${paymentsTable} (trx_id, discount_type, discount_name, amount_in_cents, is_internal, external_reward_id, reward_type, promo_code)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          `INSERT INTO ${paymentsTable} (trx_id, discount_type, discount_name, amount_in_cents, is_internal, external_reward_id, reward_type, promo_code, created_at, updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW())`,
           [transactionId, discount.type, discount.name, discount.amountInCents, !!discount.isInternal,
            meta.externalRewardId || null, meta.rewardType || null, meta.promoCode || null]
         );
@@ -1443,6 +1447,8 @@ async function meuStoreCartEvent(payload, eventType) {
     //     )                  // partner cnonfig theke asbe
     //   : { rows: [] };
     // const siteId = siteRows.rows[0] ? siteRows.rows[0].site_id : null;
+    // site_id now comes from the meu_partner_program_config row matched above (partner + venue + program).
+    const siteId = partnerRows.rows[0] && partnerRows.rows[0].site_id != null ? partnerRows.rows[0].site_id : null;
 
     if (siteId !== null) {
       const sourceTransactionsTable = `${prefix}_transactions`;
@@ -1455,23 +1461,29 @@ async function meuStoreCartEvent(payload, eventType) {
       // write clobber theirs.
       await client.query(     //check_total, member col er moddhe card json "cardNumber":"{externalId}"
         `INSERT INTO ${sourceTransactionsTable}
-           (transaction_id, site_id, pos_updated_at, trx_raw_processed)
-         VALUES ($1,$2,$3,$4)
+           (transaction_id, site_id, pos_updated_at, trx_raw_processed, member, check_total)
+         VALUES ($1,$2,$3,$4,$5,$6)
          ON CONFLICT (transaction_id, site_id) DO NOTHING`,
-        [transactionId, siteId, posUpdatedAt, true]
+        [transactionId, siteId, posUpdatedAt, true,
+         externalId ? JSON.stringify({ cardNumber: externalId }) : null, checkTotal]
       );
 
       // id has no default/identity on these two tables -- computed here in code (MAX(id)+1,
       // incremented per row), per instruction. Not safe under concurrent writers to the same
       // table; accepted as a known limitation for now.
-      const hasSourceSales = await client.query(
-        `SELECT 1 FROM ${sourceSalesTable} WHERE transaction_id = $1 AND site_id = $2 LIMIT 1`,
-        [transactionId, siteId]
-      );
-      if (!hasSourceSales.rowCount && (cart.items || []).length) {
+      // One row per product; this table has no item_id, so an item counts as already stored
+      // when a row with the same name1 and item_price exists for this transaction.
+      if ((cart.items || []).length) {
         const { rows } = await client.query(`SELECT COALESCE(MAX(id), 0) AS max_id FROM ${sourceSalesTable}`);
         let nextSaleId = Number(rows[0].max_id) + 1;
         for (const item of cart.items || []) {
+          const itemPrice = item.amountInCents != null ? item.amountInCents / 100 : null;
+          const hasItem = await client.query(
+            `SELECT 1 FROM ${sourceSalesTable}
+             WHERE transaction_id = $1 AND site_id = $2 AND name1 IS NOT DISTINCT FROM $3 AND item_price IS NOT DISTINCT FROM $4 LIMIT 1`,
+            [transactionId, siteId, item.name || null, itemPrice]
+          );
+          if (hasItem.rowCount) continue;
           const posItemId = item.metadata && item.metadata.posId != null && !isNaN(Number(item.metadata.posId))
             ? Number(item.metadata.posId) : null;
           await client.query(
@@ -1528,17 +1540,17 @@ async function meuStoreCartEvent(payload, eventType) {
 
 
 async function meuBackfillLinkFromClaim(programId, membership) {
-  if (!membership || !membership.id) return;
+  if (!programId || !membership || !membership.id || !membership.externalId) return;
   const client = await pool.connect();
   try {
-    const member = await meuResolveMember(client, membership, programId);
-    if (member) {
-      await client.query(
-        `INSERT INTO meu_member_linking (member_id, external_id, program_id, membership_id) ///
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (program_id, member_id) DO UPDATE SET membership_id = EXCLUDED.membership_id`,
-        [member.member_id, member.referral_id, programId, membership.id]
-      );
+    // UPDATE only -- a customer with no meu_member_linking row is not ours, so nothing is inserted.
+    const updated = await client.query(
+      `UPDATE meu_member_linking SET membership_id = $1
+       WHERE external_id = $2 AND program_id = $3`,
+      [membership.id, membership.externalId, programId]
+    );
+    if (!updated.rowCount) {
+      console.log('[meu] cart-claimed link backfill skipped -- customer not in meu_member_linking', JSON.stringify({ programId, membershipId: membership.id }));
     }
   } catch (err) {
     console.error('me&u link backfill from cart-claimed failed:', err.message);
@@ -1559,7 +1571,7 @@ app.post('/meu/webhooks', async (req, res) => {
       const result = await meuStoreCartEvent(payload, type);
       if (type === 'cart-claimed') await meuBackfillLinkFromClaim(payload && payload.programId, payload && payload.membership);
       if (result && result.skipped) {
-        return res.status(200).json({ status: 'ok', skipped: true, message: 'Membership not linked -- transaction not stored' });
+        return res.status(200).json({ status: 'ok', skipped: true, message: 'Customer is not a linked member -- transaction skipped' });
       }
       return res.status(200).json({ status: 'ok' });
     }
