@@ -7,7 +7,7 @@ const crypto = require('crypto');
 // const verifyImposSignature = require('./verifyImposSignature'); // TODO: restore once you have the real file -- the local stub was removed
 const app = express();
 GROUP_ID = 5
-
+const IS_TESTING = true;
 
 // API hit log: one line per request (method, path, status, ms) for EVERY route. me&u routes also print the request and
 // response bodies, with mobile/email masked; headers and query strings are never logged. MEU_LOG_BODIES=false turns bodies off.
@@ -44,9 +44,9 @@ app.use(express.json({
 //   verifyImposSignature(req, res, next);
 // });
 
-// Global key requirement removed -- only /auto-linking and /meu/webhooks require x-api-key now
+// Global key requirement removed -- /auto-linking, /meu/webhooks, /meu/apply-reward, and /meu/points-balance require x-api-key
 // (each via meuAuthOk on its own route). Every other route, including all /loyalty/* and the
-// other /meu/* routes, needs no key.
+// remaining /meu/* routes, needs no key.
 
 // Set up the PostgreSQL connection pool
 const pool = new Pool({
@@ -82,622 +82,622 @@ app.get('/test', async (req, res) => {
   }
 });
 
-app.get('/loyalty/enquiry', async (req, res) => {
-  const {
-    cardId:cardNumber,
-    siteId,
-    stationId,
-    email,
-    phone,
-    membershipNo
-  } = req.query;
-
-  console.log("Enquiry request:", req.query);
-  if (isNaN(Number(siteId))) {
-    return res.status(200).json({
-      success: false,
-      errorCode: "INVALID_REQUEST",
-      message: "siteId must be numeric (e.g 5)"
-    });
-  }
-
-  // At least one identifier is required
-  if (!cardNumber && !email && !phone && !membershipNo) {
-    return res.status(200).json({
-      success: false,
-      errorCode: "INVALID_REQUEST",
-      message: "Provide cardId, email, phone or membershipNo"
-    });
-  }
-
-  if (!siteId) {
-    return res.status(200).json({
-      success: false,
-      errorCode: "INVALID_REQUEST",
-      message: "siteId is required"
-    });
-  }
-
-
-
-
-  let client;
-  let partnerId = null;
-  let lookupCardNumber = cardNumber;
-
-  try {
-    client = await pool.connect();
-    console.log("req.clientId ",req?.clientId)
-    // Lookup partner
-    partnerId = await getPartnerId(client,req?.clientId,siteId)
-    console.log("Partner id ",partnerId)
-    if (!partnerId) {
-      return res.status(200).json({
-        success: false,
-        errorCode: "SITE_NOT_FOUND",
-        message: "Invalid site"
-      });
-    }
-
-
-
-    // Optional lookup if cardNumber wasn't supplied
-    if (!lookupCardNumber) {
-      const member = await client.query(
-        `SELECT referral_id
-         FROM aura_customer
-         WHERE (
-             phone = $1
-            OR email = $2
-
-         )
-         LIMIT 1`,
-        [
-
-          phone || null,
-          email || null
-
-        ]
-      );
-
-      if (member.rowCount === 0) {
-        return res.status(200).json({
-          success: false,
-          errorCode: "CARD_NOT_FOUND",
-          message: "Member not found"
-        });
-      }
-
-      lookupCardNumber = member.rows[0].referral_id;
-    }
-
-    const endpoint =
-      `enquiry?partnerId=${partnerId}&barcodeText=${encodeURIComponent(lookupCardNumber)}`;
-
-      console.log("callRedemptionService endpoint===> ",endpoint)
-
-    const data = await callRedemptionService(endpoint);
-    console.log("response from callRedemptionService")
-    // Forward business errors from redemption service
-    if (!data.success) {
-      return res.status(200).json({
-        success: false,
-        errorCode: data.errorCode,
-        message: data.errorMessage
-      });
-    }
-    const resObj ={
-      success: true,
-      "partnerMemberId": cardNumber, //data?.profile?.member_id,
-      "profile": {
-        "firstName": data?.profile?.given_name,
-        "lastName": data?.profile?.family_name,
-        "email": data?.profile?.email,
-        "mobile": data?.profile?.phone ?? "",
-      },
-
-      balance: Number(data.balance || 0) * 100,
-      currency: "AUD",
-      status: data.valid ? "active" : "inactive"
-    }
-    console.log("RESPONSE :", resObj);
-    return res.status(200).json(resObj);
-
-  } catch (err) {
-    console.error("Error in /enquiry:", err);
-
-    try {
-      await storeErrorLog({
-        recordId: null,
-        memberId: null,
-        eventType: "ENQUIRY",
-        errorType: "SERVER_ERROR",
-        errorMessage: err.message,
-        withdrawalPartner: partnerId
-      });
-    } catch (e) {
-      console.error("Failed to log error:", e);
-    }
-
-    if(err.response)
-    {
-
-    }
-    return res.status(500).json({
-      success: false,
-      errorCode: "SYSTEM_ERROR",
-      message: "Internal Server Error"
-    });
-
-  } finally {
-    if (client) client.release();
-  }
-});
-
-app.get('/loyalty/member', async (req, res) => {
-  const {
-    membershipNo: cardNumber,
-    siteId,
-    stationId,
-    name,
-    email,
-    phone
-  } = req.query;
-
-  console.log("Enquiry request:", req.query);
-
-  // Validate siteId
-  if (!siteId) {
-    return res.status(200).json({
-      success: false,
-      errorCode: "INVALID_REQUEST",
-      message: "siteId is required"
-    });
-  }
-
-  if (isNaN(Number(siteId))) {
-    return res.status(200).json({
-      success: false,
-      errorCode: "INVALID_REQUEST",
-      message: "siteId must be numeric (e.g. 23)"
-    });
-  }
-
-  // At least one identifier is required
-  if (!cardNumber && !email && !phone && !name) {
-    return res.status(200).json({
-      success: false,
-      errorCode: "INVALID_REQUEST",
-      message: "Provide at least one of membershipNo, name, email, or phone"
-    });
-  }
-
-
-  let client;
-  let partnerId = null;
-
-  // Use cardNumber directly if supplied
-  let lookupCardNumber = cardNumber
-    ? String(cardNumber).trim()
-    : null;
-
-  try {
-    client = await pool.connect();
-
-    console.log("req.clientId:", req?.clientId);
-
-    // Lookup partner
-    partnerId = await getPartnerId(
-      client,
-      req?.clientId,
-      siteId
-    );
-
-    console.log("Partner id:", partnerId);
-
-    if (!partnerId) {
-      return res.status(200).json({
-        success: false,
-        errorCode: "SITE_NOT_FOUND",
-        message: "Invalid site"
-      });
-    }
-
-    // Lookup member if membershipNo was not supplied
-    if (!lookupCardNumber) {
-      const conditions = [];
-      const values = [];
-
-      if (phone) {
-        values.push(phone);
-        conditions.push(`phone = $${values.length}`);
-      }
-
-      if (email) {
-        values.push(email.toLowerCase());
-        conditions.push(`lower(email) = $${values.length}`);
-      }
-
-      if (name) {
-        values.push(`${name.toLowerCase()}`);
-        conditions.push(`lower(given_name) = $${values.length}` );
-      }
-
-      const query = `
-        SELECT referral_id
-        FROM aura_customer
-        WHERE ${conditions.join(" OR ")}
-        LIMIT 1
-      `;
-
-      console.log("Member lookup query:", query);
-
-      const member = await client.query(query, values);
-
-      if (member.rowCount === 0) {
-        return res.status(200).json({
-          success: false,
-          errorCode: "CARD_NOT_FOUND",
-          message: "Member not found"
-        });
-      }
-
-      lookupCardNumber = member.rows[0].referral_id;
-    }
-
-    if (!lookupCardNumber) {
-      return res.status(200).json({
-        success: false,
-        errorCode: "CARD_NOT_FOUND",
-        message: "Member does not have a valid membership number"
-      });
-    }
-
-    const endpoint =
-      `enquiry?partnerId=${partnerId}` +
-      `&barcodeText=${encodeURIComponent(lookupCardNumber)}`;
-
-    console.log(
-      "callRedemptionService endpoint:",
-      endpoint
-    );
-
-    const data = await callRedemptionService(endpoint);
-
-    console.log(
-      "Response from callRedemptionService:",
-      data
-    );
-
-    // Forward business errors from redemption service
-    if (!data?.success) {
-      const errorPayload = {
-        success: false,
-        errorCode: data?.errorCode || "CARD_NOT_FOUND",
-        message: data?.errorMessage || "Member not found"
-      };
-
-      console.log("BUSINESS ERROR RESPONSE:", errorPayload);
-
-      return res.status(200).json(errorPayload);
-    }
-
-    const responsePayload = {
-      success: true,
-      members:[
-        {
-          partnerMemberId: lookupCardNumber, // data?.profile?.member_id,
-          profile: {
-            firstName: data?.profile?.given_name,
-            lastName: data?.profile?.family_name,
-            email: data?.profile?.email,
-            mobile: data?.profile?.phone ?? "",
-          },
-          tier:{
-            code:"",
-            name:""
-          },
-          balance: Number(data.balance || 0) * 100,
-          currency: "AUD",
-          status: data.valid ? "active" : "inactive"
-        }
-      ]
-    };
-
-    console.log("RESPONSE :", responsePayload);
-
-    return res.status(200).json(responsePayload);
-
-
-  } catch (err) {
-    console.error(
-      "Error in /loyalty/member:",
-      err?.response?.data || err.message
-    );
-
-    try {
-      await storeErrorLog({
-        recordId: null,
-        memberId: null,
-        eventType: "ENQUIRY",
-        errorType: "SERVER_ERROR",
-        errorMessage:
-          err?.response?.data?.message ||
-          err.message ||
-          "Unknown server error",
-        withdrawalPartner: partnerId
-      });
-    } catch (logError) {
-      console.error(
-        "Failed to log error:",
-        logError.message
-      );
-    }
-
-    return res.status(500).json({
-      success: false,
-      errorCode: "SYSTEM_ERROR",
-      message: "Internal Server Error"
-    });
-
-  } finally {
-    if (client) {
-      client.release();
-    }
-  }
-});
-
-// POST /redemptions
-app.post('/loyalty/redeem', async (req, res) => {
-  const {
-    cardId: barcodeText,
-    requestedAmount: amount,
-    orderId,
-    authCode,
-    siteId,
-    stationId: posId,
-    transactionRef
-  } = req.body;
-
-  console.table(req.body)
-  let client;
-  try {
-    client = await pool.connect();
-
-    // if(barcodeText.trim()!=='987456321000')
-    //   {
-    //     return res.status(200).json({
-    //       success: false,
-    //       errorCode: `TEST_CARD_REQUIRED`,
-    //       message:  `Card does not match (received cardId: ${barcodeText.trim()})`
-    //     });
-    // }
-
-    if (isNaN(Number(siteId))) {
-      return res.status(200).json({
-        success: false,
-        errorCode: "INVALID_REQUEST",
-        message: "siteId must be numeric (e.g 5)"
-      });
-    }
-
-
-    const  partnerId = await getPartnerId(client,req?.clientId,siteId)
-    if (!partnerId) {
-      return res.status(200).json({
-        success: false,
-        errorCode: "SITE_NOT_FOUND",
-        message: "Invalid site"
-      });
-    }
-
-    const payload = {
-      partnerId,
-      barcodeText,
-      orderId,
-      transactionRef,
-      amount,
-      authCode,
-      withdrawalType: "instore",
-      withdrawalInstrument: "Halo_Loyalty_Card",
-      tipAmount: 0,
-      withdrawalGateWay: "IMPOS"
-    };
-
-
-    const data = await callRedemptionService('redeem','POST',payload);
-
-    if (!data.success) {
-      return res.status(200).json({
-        success: false,
-        errorCode: data.errorCode || "REDEMPTION_FAILED",
-        message: data.errorMessage || "Redemption failed"
-      });
-    }
-    let obj = {
-      success: true,
-      successMessage:`${amount} has been redeemed from balance.`,
-      grantedAmount: Number(data.amountRedeemed) * 100,
-      newBalance: Number(data.remainingBalance) * 100,
-      partnerReference: data.partnerReference
-
-    }
-    console.log("===RESPONSE==")
-    console.table(obj)
-    return res.status(200).json(obj);
-
-  } catch (err) {
-    console.error("Error in /loyalty/redeem:", err);
-    return res.status(500).json(SERVER_ERROR);
-  } finally {
-    if (client) client.release();
-  }
-});
-
-// POST /refund
-app.post('/loyalty/reversal', async (req, res) => {
-  let  {
-    cardId:barcodeText,
-    transactionRef,
-    originalTransactionRef, // unqie identifier to search a record_id
-    partnerReference,
-    orderId
-  } = req.body;
-  let client;
-  console.table(req.body)
-  try {
-    // if(barcodeText.trim()!=='987456321000')
-    //   {
-    //     return res.status(200).json({
-    //       success: false,
-    //       errorCode: `TEST_CARD_REQUIRED`,
-    //       message:  `Card does not match (received cardId: ${barcodeText.trim()})`
-    //     });
-    // }
-
-            // Phase 1: find member_id
-          client = await pool.connect();
-          const redemption = await getOriginalRedemption(client, partnerReference, originalTransactionRef)
-          if (!redemption)
-            {
-                return res.status(200).json({
-                    success:false,
-                    errorCode:"ORIGINAL_TRANSACTION_NOT_FOUND", //"ORIGINAL_TRANSACTION_NOT_FOUND",
-                    message:"Original redemption not found"
-                });
-            }
-          const payload={
-            posId:redemption.pos_id,
-            withdrawalInstrument:'Halo_Loyalty_Card',
-            metadata:{},
-            withdrawalGateWay:'IMPOS',
-            partnerId: redemption.partner_id,
-            memberId:redemption.member_id,
-            venue:redemption.venue,
-            transactionRef,
-            originalTransactionRef,
-            amount:redemption.refund_amount
-          }
-
-          const endpoint = `refund`;
-          const data = await callRedemptionService(endpoint,'POST',payload)
-
-          if (!data.success) {
-            return res.status(200).json({
-              success: false,
-              errorCode: data.errorCode || "REVERSAL_FAILED",
-              message: data.errorMessage || "Reversal failed"
-            });
-          }
-
-          let obj = {
-            success: true,
-            newBalance: Number(data.remainingBalance) * 100,
-            // partnerReference: data.partnerReference,
-            // errorCode: data.errorCode,
-            // message: data.errorMessage
-
-          }
-          console.log("===RESPONSE==")
-          console.table(obj)
-
-          return res.status(200).json(obj);
-
-
-
-  } catch (err) {
-        try {
-            if (client) {
-                await client.query("ROLLBACK");
-            }
-
-        } catch (rollbackErr)
-        {
-          console.error("Rollback failed:", rollbackErr);
-        }
-     console.error(
-            `Refund rollback for original transaction ${originalTransactionRef}`,
-            err
-        );
-    return res.status(500).json(SERVER_ERROR);
-  }
-  finally{
-    if (client) {
-          client.release();
-      }
-  }
-});
-
-const getPartnerIdV2 = async (client, groupId, siteId) => {
-  const { rows } = await client.query(
-    `SELECT partner_id
-     FROM impos_sites
-     WHERE management_group_id = $1
-       AND site_id = $2
-     LIMIT 1`,
-    [groupId, siteId]
-  );
-
-  return rows.length ? rows[0].partner_id : null;
-};
-const getPartnerId = async (client, clientId, siteId) => {
-  const { rows } = await client.query(
-    `SELECT partner_id
-     FROM impos_sites
-     WHERE site_id = $1  AND client_id=$2
-     LIMIT 1`,
-    [siteId,clientId]
-  );
-
-  return rows.length ? rows[0].partner_id : null;
-};
-
-
-
-const getOriginalRedemption = async (client, partnerReference,originalTransactionRef) => {
-  const { rows } = await client.query(
-    ` SELECT withdrawal_amount as refund_amount, withdrawal_partner as partner_id,member_id,
-     aura_id, pos_id, venue,
-
-    withdrawal_type FROM withdrawal_events
-     WHERE (aura_id = $1
-       and merchant_ref_trxid = $2)
-       and event_type='redemption'
-     LIMIT 1`,
-    [partnerReference, originalTransactionRef]
-  );
-
-  return rows.length ? rows[0] : null;
-};
-const callRedemptionService = async (endpoint, method = 'GET', data = null, headers = {}) => {
-  const apiUrl = `https://jqzlxs0nr9.execute-api.ap-southeast-2.amazonaws.com/v1/${endpoint}`;
-
-  try {
-    let response;
-    if (method === 'GET') {
-      response = await axios.get(apiUrl, { headers });
-    } else if (method === 'POST') {
-      response = await axios.post(apiUrl, data, { headers });
-    } else {
-      throw new Error(`Unsupported method: ${method}`);
-    }
-
-    return {
-      statusCode: response.status,
-      ...response.data
-    };
-  } catch (err) {
-    if (err.response) {
-      // Downstream returned a business error (e.g. 404 with JSON body)
-      console.log("Error from service ",err.response)
-      return {
-        statusCode: err.response.status,
-        ...err.response.data
-      };
-    }
-    throw err; // true transport error (timeout, DNS, etc.)
-  }
-};
+// app.get('/loyalty/enquiry', async (req, res) => {
+//   const {
+//     cardId:cardNumber,
+//     siteId,
+//     stationId,
+//     email,
+//     phone,
+//     membershipNo
+//   } = req.query;
+
+//   console.log("Enquiry request:", req.query);
+//   if (isNaN(Number(siteId))) {
+//     return res.status(200).json({
+//       success: false,
+//       errorCode: "INVALID_REQUEST",
+//       message: "siteId must be numeric (e.g 5)"
+//     });
+//   }
+
+//   // At least one identifier is required
+//   if (!cardNumber && !email && !phone && !membershipNo) {
+//     return res.status(200).json({
+//       success: false,
+//       errorCode: "INVALID_REQUEST",
+//       message: "Provide cardId, email, phone or membershipNo"
+//     });
+//   }
+
+//   if (!siteId) {
+//     return res.status(200).json({
+//       success: false,
+//       errorCode: "INVALID_REQUEST",
+//       message: "siteId is required"
+//     });
+//   }
+
+
+
+
+//   let client;
+//   let partnerId = null;
+//   let lookupCardNumber = cardNumber;
+
+//   try {
+//     client = await pool.connect();
+//     console.log("req.clientId ",req?.clientId)
+//     // Lookup partner
+//     partnerId = await getPartnerId(client,req?.clientId,siteId)
+//     console.log("Partner id ",partnerId)
+//     if (!partnerId) {
+//       return res.status(200).json({
+//         success: false,
+//         errorCode: "SITE_NOT_FOUND",
+//         message: "Invalid site"
+//       });
+//     }
+
+
+
+//     // Optional lookup if cardNumber wasn't supplied
+//     if (!lookupCardNumber) {
+//       const member = await client.query(
+//         `SELECT referral_id
+//          FROM aura_customer
+//          WHERE (
+//              phone = $1
+//             OR email = $2
+
+//          )
+//          LIMIT 1`,
+//         [
+
+//           phone || null,
+//           email || null
+
+//         ]
+//       );
+
+//       if (member.rowCount === 0) {
+//         return res.status(200).json({
+//           success: false,
+//           errorCode: "CARD_NOT_FOUND",
+//           message: "Member not found"
+//         });
+//       }
+
+//       lookupCardNumber = member.rows[0].referral_id;
+//     }
+
+//     const endpoint =
+//       `enquiry?partnerId=${partnerId}&barcodeText=${encodeURIComponent(lookupCardNumber)}`;
+
+//       console.log("callRedemptionService endpoint===> ",endpoint)
+
+//     const data = await callRedemptionService(endpoint);
+//     console.log("response from callRedemptionService")
+//     // Forward business errors from redemption service
+//     if (!data.success) {
+//       return res.status(200).json({
+//         success: false,
+//         errorCode: data.errorCode,
+//         message: data.errorMessage
+//       });
+//     }
+//     const resObj ={
+//       success: true,
+//       "partnerMemberId": cardNumber, //data?.profile?.member_id,
+//       "profile": {
+//         "firstName": data?.profile?.given_name,
+//         "lastName": data?.profile?.family_name,
+//         "email": data?.profile?.email,
+//         "mobile": data?.profile?.phone ?? "",
+//       },
+
+//       balance: Number(data.balance || 0) * 100,
+//       currency: "AUD",
+//       status: data.valid ? "active" : "inactive"
+//     }
+//     console.log("RESPONSE :", resObj);
+//     return res.status(200).json(resObj);
+
+//   } catch (err) {
+//     console.error("Error in /enquiry:", err);
+
+//     try {
+//       await storeErrorLog({
+//         recordId: null,
+//         memberId: null,
+//         eventType: "ENQUIRY",
+//         errorType: "SERVER_ERROR",
+//         errorMessage: err.message,
+//         withdrawalPartner: partnerId
+//       });
+//     } catch (e) {
+//       console.error("Failed to log error:", e);
+//     }
+
+//     if(err.response)
+//     {
+
+//     }
+//     return res.status(500).json({
+//       success: false,
+//       errorCode: "SYSTEM_ERROR",
+//       message: "Internal Server Error"
+//     });
+
+//   } finally {
+//     if (client) client.release();
+//   }
+// });
+
+// app.get('/loyalty/member', async (req, res) => {
+//   const {
+//     membershipNo: cardNumber,
+//     siteId,
+//     stationId,
+//     name,
+//     email,
+//     phone
+//   } = req.query;
+
+//   console.log("Enquiry request:", req.query);
+
+//   // Validate siteId
+//   if (!siteId) {
+//     return res.status(200).json({
+//       success: false,
+//       errorCode: "INVALID_REQUEST",
+//       message: "siteId is required"
+//     });
+//   }
+
+//   if (isNaN(Number(siteId))) {
+//     return res.status(200).json({
+//       success: false,
+//       errorCode: "INVALID_REQUEST",
+//       message: "siteId must be numeric (e.g. 23)"
+//     });
+//   }
+
+//   // At least one identifier is required
+//   if (!cardNumber && !email && !phone && !name) {
+//     return res.status(200).json({
+//       success: false,
+//       errorCode: "INVALID_REQUEST",
+//       message: "Provide at least one of membershipNo, name, email, or phone"
+//     });
+//   }
+
+
+//   let client;
+//   let partnerId = null;
+
+//   // Use cardNumber directly if supplied
+//   let lookupCardNumber = cardNumber
+//     ? String(cardNumber).trim()
+//     : null;
+
+//   try {
+//     client = await pool.connect();
+
+//     console.log("req.clientId:", req?.clientId);
+
+//     // Lookup partner
+//     partnerId = await getPartnerId(
+//       client,
+//       req?.clientId,
+//       siteId
+//     );
+
+//     console.log("Partner id:", partnerId);
+
+//     if (!partnerId) {
+//       return res.status(200).json({
+//         success: false,
+//         errorCode: "SITE_NOT_FOUND",
+//         message: "Invalid site"
+//       });
+//     }
+
+//     // Lookup member if membershipNo was not supplied
+//     if (!lookupCardNumber) {
+//       const conditions = [];
+//       const values = [];
+
+//       if (phone) {
+//         values.push(phone);
+//         conditions.push(`phone = $${values.length}`);
+//       }
+
+//       if (email) {
+//         values.push(email.toLowerCase());
+//         conditions.push(`lower(email) = $${values.length}`);
+//       }
+
+//       if (name) {
+//         values.push(`${name.toLowerCase()}`);
+//         conditions.push(`lower(given_name) = $${values.length}` );
+//       }
+
+//       const query = `
+//         SELECT referral_id
+//         FROM aura_customer
+//         WHERE ${conditions.join(" OR ")}
+//         LIMIT 1
+//       `;
+
+//       console.log("Member lookup query:", query);
+
+//       const member = await client.query(query, values);
+
+//       if (member.rowCount === 0) {
+//         return res.status(200).json({
+//           success: false,
+//           errorCode: "CARD_NOT_FOUND",
+//           message: "Member not found"
+//         });
+//       }
+
+//       lookupCardNumber = member.rows[0].referral_id;
+//     }
+
+//     if (!lookupCardNumber) {
+//       return res.status(200).json({
+//         success: false,
+//         errorCode: "CARD_NOT_FOUND",
+//         message: "Member does not have a valid membership number"
+//       });
+//     }
+
+//     const endpoint =
+//       `enquiry?partnerId=${partnerId}` +
+//       `&barcodeText=${encodeURIComponent(lookupCardNumber)}`;
+
+//     console.log(
+//       "callRedemptionService endpoint:",
+//       endpoint
+//     );
+
+//     const data = await callRedemptionService(endpoint);
+
+//     console.log(
+//       "Response from callRedemptionService:",
+//       data
+//     );
+
+//     // Forward business errors from redemption service
+//     if (!data?.success) {
+//       const errorPayload = {
+//         success: false,
+//         errorCode: data?.errorCode || "CARD_NOT_FOUND",
+//         message: data?.errorMessage || "Member not found"
+//       };
+
+//       console.log("BUSINESS ERROR RESPONSE:", errorPayload);
+
+//       return res.status(200).json(errorPayload);
+//     }
+
+//     const responsePayload = {
+//       success: true,
+//       members:[
+//         {
+//           partnerMemberId: lookupCardNumber, // data?.profile?.member_id,
+//           profile: {
+//             firstName: data?.profile?.given_name,
+//             lastName: data?.profile?.family_name,
+//             email: data?.profile?.email,
+//             mobile: data?.profile?.phone ?? "",
+//           },
+//           tier:{
+//             code:"",
+//             name:""
+//           },
+//           balance: Number(data.balance || 0) * 100,
+//           currency: "AUD",
+//           status: data.valid ? "active" : "inactive"
+//         }
+//       ]
+//     };
+
+//     console.log("RESPONSE :", responsePayload);
+
+//     return res.status(200).json(responsePayload);
+
+
+//   } catch (err) {
+//     console.error(
+//       "Error in /loyalty/member:",
+//       err?.response?.data || err.message
+//     );
+
+//     try {
+//       await storeErrorLog({
+//         recordId: null,
+//         memberId: null,
+//         eventType: "ENQUIRY",
+//         errorType: "SERVER_ERROR",
+//         errorMessage:
+//           err?.response?.data?.message ||
+//           err.message ||
+//           "Unknown server error",
+//         withdrawalPartner: partnerId
+//       });
+//     } catch (logError) {
+//       console.error(
+//         "Failed to log error:",
+//         logError.message
+//       );
+//     }
+
+//     return res.status(500).json({
+//       success: false,
+//       errorCode: "SYSTEM_ERROR",
+//       message: "Internal Server Error"
+//     });
+
+//   } finally {
+//     if (client) {
+//       client.release();
+//     }
+//   }
+// });
+
+// // POST /redemptions
+// app.post('/loyalty/redeem', async (req, res) => {
+//   const {
+//     cardId: barcodeText,
+//     requestedAmount: amount,
+//     orderId,
+//     authCode,
+//     siteId,
+//     stationId: posId,
+//     transactionRef
+//   } = req.body;
+
+//   console.table(req.body)
+//   let client;
+//   try {
+//     client = await pool.connect();
+
+//     // if(barcodeText.trim()!=='987456321000')
+//     //   {
+//     //     return res.status(200).json({
+//     //       success: false,
+//     //       errorCode: `TEST_CARD_REQUIRED`,
+//     //       message:  `Card does not match (received cardId: ${barcodeText.trim()})`
+//     //     });
+//     // }
+
+//     if (isNaN(Number(siteId))) {
+//       return res.status(200).json({
+//         success: false,
+//         errorCode: "INVALID_REQUEST",
+//         message: "siteId must be numeric (e.g 5)"
+//       });
+//     }
+
+
+//     const  partnerId = await getPartnerId(client,req?.clientId,siteId)
+//     if (!partnerId) {
+//       return res.status(200).json({
+//         success: false,
+//         errorCode: "SITE_NOT_FOUND",
+//         message: "Invalid site"
+//       });
+//     }
+
+//     const payload = {
+//       partnerId,
+//       barcodeText,
+//       orderId,
+//       transactionRef,
+//       amount,
+//       authCode,
+//       withdrawalType: "instore",
+//       withdrawalInstrument: "Halo_Loyalty_Card",
+//       tipAmount: 0,
+//       withdrawalGateWay: "IMPOS"
+//     };
+
+
+//     const data = await callRedemptionService('redeem','POST',payload);
+
+//     if (!data.success) {
+//       return res.status(200).json({
+//         success: false,
+//         errorCode: data.errorCode || "REDEMPTION_FAILED",
+//         message: data.errorMessage || "Redemption failed"
+//       });
+//     }
+//     let obj = {
+//       success: true,
+//       successMessage:`${amount} has been redeemed from balance.`,
+//       grantedAmount: Number(data.amountRedeemed) * 100,
+//       newBalance: Number(data.remainingBalance) * 100,
+//       partnerReference: data.partnerReference
+
+//     }
+//     console.log("===RESPONSE==")
+//     console.table(obj)
+//     return res.status(200).json(obj);
+
+//   } catch (err) {
+//     console.error("Error in /loyalty/redeem:", err);
+//     return res.status(500).json(SERVER_ERROR);
+//   } finally {
+//     if (client) client.release();
+//   }
+// });
+
+// // POST /refund
+// app.post('/loyalty/reversal', async (req, res) => {
+//   let  {
+//     cardId:barcodeText,
+//     transactionRef,
+//     originalTransactionRef, // unqie identifier to search a record_id
+//     partnerReference,
+//     orderId
+//   } = req.body;
+//   let client;
+//   console.table(req.body)
+//   try {
+//     // if(barcodeText.trim()!=='987456321000')
+//     //   {
+//     //     return res.status(200).json({
+//     //       success: false,
+//     //       errorCode: `TEST_CARD_REQUIRED`,
+//     //       message:  `Card does not match (received cardId: ${barcodeText.trim()})`
+//     //     });
+//     // }
+
+//             // Phase 1: find member_id
+//           client = await pool.connect();
+//           const redemption = await getOriginalRedemption(client, partnerReference, originalTransactionRef)
+//           if (!redemption)
+//             {
+//                 return res.status(200).json({
+//                     success:false,
+//                     errorCode:"ORIGINAL_TRANSACTION_NOT_FOUND", //"ORIGINAL_TRANSACTION_NOT_FOUND",
+//                     message:"Original redemption not found"
+//                 });
+//             }
+//           const payload={
+//             posId:redemption.pos_id,
+//             withdrawalInstrument:'Halo_Loyalty_Card',
+//             metadata:{},
+//             withdrawalGateWay:'IMPOS',
+//             partnerId: redemption.partner_id,
+//             memberId:redemption.member_id,
+//             venue:redemption.venue,
+//             transactionRef,
+//             originalTransactionRef,
+//             amount:redemption.refund_amount
+//           }
+
+//           const endpoint = `refund`;
+//           const data = await callRedemptionService(endpoint,'POST',payload)
+
+//           if (!data.success) {
+//             return res.status(200).json({
+//               success: false,
+//               errorCode: data.errorCode || "REVERSAL_FAILED",
+//               message: data.errorMessage || "Reversal failed"
+//             });
+//           }
+
+//           let obj = {
+//             success: true,
+//             newBalance: Number(data.remainingBalance) * 100,
+//             // partnerReference: data.partnerReference,
+//             // errorCode: data.errorCode,
+//             // message: data.errorMessage
+
+//           }
+//           console.log("===RESPONSE==")
+//           console.table(obj)
+
+//           return res.status(200).json(obj);
+
+
+
+//   } catch (err) {
+//         try {
+//             if (client) {
+//                 await client.query("ROLLBACK");
+//             }
+
+//         } catch (rollbackErr)
+//         {
+//           console.error("Rollback failed:", rollbackErr);
+//         }
+//      console.error(
+//             `Refund rollback for original transaction ${originalTransactionRef}`,
+//             err
+//         );
+//     return res.status(500).json(SERVER_ERROR);
+//   }
+//   finally{
+//     if (client) {
+//           client.release();
+//       }
+//   }
+// });
+
+// const getPartnerIdV2 = async (client, groupId, siteId) => {
+//   const { rows } = await client.query(
+//     `SELECT partner_id
+//      FROM impos_sites
+//      WHERE management_group_id = $1
+//        AND site_id = $2
+//      LIMIT 1`,
+//     [groupId, siteId]
+//   );
+
+//   return rows.length ? rows[0].partner_id : null;
+// };
+// const getPartnerId = async (client, clientId, siteId) => {
+//   const { rows } = await client.query(
+//     `SELECT partner_id
+//      FROM impos_sites
+//      WHERE site_id = $1  AND client_id=$2
+//      LIMIT 1`,
+//     [siteId,clientId]
+//   );
+
+//   return rows.length ? rows[0].partner_id : null;
+// };
+
+
+
+// const getOriginalRedemption = async (client, partnerReference,originalTransactionRef) => {
+//   const { rows } = await client.query(
+//     ` SELECT withdrawal_amount as refund_amount, withdrawal_partner as partner_id,member_id,
+//      aura_id, pos_id, venue,
+
+//     withdrawal_type FROM withdrawal_events
+//      WHERE (aura_id = $1
+//        and merchant_ref_trxid = $2)
+//        and event_type='redemption'
+//      LIMIT 1`,
+//     [partnerReference, originalTransactionRef]
+//   );
+
+//   return rows.length ? rows[0] : null;
+// };
+// const callRedemptionService = async (endpoint, method = 'GET', data = null, headers = {}) => {
+//   const apiUrl = `https://jqzlxs0nr9.execute-api.ap-southeast-2.amazonaws.com/v1/${endpoint}`;
+
+//   try {
+//     let response;
+//     if (method === 'GET') {
+//       response = await axios.get(apiUrl, { headers });
+//     } else if (method === 'POST') {
+//       response = await axios.post(apiUrl, data, { headers });
+//     } else {
+//       throw new Error(`Unsupported method: ${method}`);
+//     }
+
+//     return {
+//       statusCode: response.status,
+//       ...response.data
+//     };
+//   } catch (err) {
+//     if (err.response) {
+//       // Downstream returned a business error (e.g. 404 with JSON body)
+//       console.log("Error from service ",err.response)
+//       return {
+//         statusCode: err.response.status,
+//         ...err.response.data
+//       };
+//     }
+//     throw err; // true transport error (timeout, DNS, etc.)
+//   }
+// };
 
 
 
@@ -712,6 +712,8 @@ const callRedemptionService = async (endpoint, method = 'GET', data = null, head
  * @param {string} logData.errorType - Type of error (e.g., "DB_ERROR")
  * @param {string} logData.errorMessage - Error message text
  */
+
+
 async function storeErrorLog({
   requestPayload = null,
   responsePayload = null,
@@ -989,7 +991,7 @@ app.post('/meu/membership-link', async (req, res) => {
 // Hot: me&u calls this on every venue home / cart view and every cart change, so it stays thin --
 // no aura_logs on success, and the balance call never writes anything.
 // Offers/deals/promo codes are out of scope: `rewards` holds at most the one cashback PointShopOffer.
-const API_KEY = process.env.API_KEY; // checked as x-api-key on /auto-linking and /meu/webhooks only
+const API_KEY = process.env.API_KEY; // checked as x-api-key on /auto-linking, /meu/webhooks, /meu/apply-reward, and /meu/points-balance
 
 function safeEqual(a, b) {
   const x = Buffer.from(String(a || ''));
@@ -1179,10 +1181,25 @@ async function meuApply({ partner, externalId, cart }) {
 //        discounts: [{isInternal,name,amountInCents,metadata?}] }, venueId, programId }
 // OUT: { status: 'ok', membership: { id, pointsBalance, rewards: [] | [PointShopOffer] } }
 app.post('/meu/points-balance', async (req, res) => {
+  if (!meuAuthOk(req)) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
   try {
     const { membership, cart, venueId, programId } = req.body || {};
-    if (!membership || !membership.externalId || !venueId || !programId) {
-      return res.status(400).json({ status: 'error', message: 'membership.externalId, venueId and programId are required' });
+    if (!membership || (!membership.externalId && !membership.id) || !venueId || !programId) {
+      return res.status(400).json({ status: 'error', message: 'membership.id or membership.externalId, venueId and programId are required' });
+    }
+
+    let externalId = membership.externalId;
+    if (!externalId && membership.id) {
+      const linkRows = await queryDatabase(
+        `SELECT external_id FROM meu_member_linking WHERE membership_id = $1 AND program_id = $2 LIMIT 1`,
+        [membership.id, programId]
+      );
+      if (linkRows.length) {
+        externalId = linkRows[0].external_id;
+      }
+    }
+    if (!externalId) {
+      return res.status(404).json({ status: 'error', message: 'Member linking not found' });
     }
 
     // Resolve partner_id + redemption limits for this venue+program -- own query, not getMeuPartner.
@@ -1203,13 +1220,17 @@ app.post('/meu/points-balance', async (req, res) => {
     // Used raw, exactly as the service returns it: no unit conversion.
     let pointsData;
     try {
-      const response = await axios.get(`https://jqzlxs0nr9.execute-api.ap-southeast-2.amazonaws.com/v1/meu/points?partnerId=${partnerId}&externalId=${encodeURIComponent(membership.externalId)}`);
+      const response = await axios.get(`https://jqzlxs0nr9.execute-api.ap-southeast-2.amazonaws.com/v1/meu/points?partnerId=${partnerId}&externalId=${encodeURIComponent(externalId)}`);
       pointsData = response.data;
     } catch (err) {
       pointsData = err.response ? err.response.data : { success: false, errorMessage: err.message };
     }
     if (!pointsData.success) return res.status(404).json({ status: 'error', message: pointsData.errorMessage || 'Member not found' });
-    const balance = pointsData.valid ? Number(pointsData.balance) || 0 : 0;
+    const balance = pointsData.points != null
+      ? Number(pointsData.points)
+      : (pointsData.totalPoints != null
+          ? Number(pointsData.totalPoints)
+          : (pointsData.valid ? Number(pointsData.balance) || 0 : 0));
 
     // Cashback offer calc -- own copy, not meuCalc/meuOffer/meuApplicableCents/meuAppliedCents.
     const isOurs = (d) => !!(d && d.metadata && d.metadata.externalRewardId === MEU_OFFER_ID);
@@ -1262,6 +1283,7 @@ app.post('/meu/points-balance', async (req, res) => {
 //      The request carries no program id: the partner is found from cart.venueId alone.
 // OUT: { status: 'ok', rewards: [PointShopOffer] } -- SELECTED_TO_REDEEM with discountAmountInCents, or UNAVAILABLE_TO_REDEEM with a cause
 app.post('/meu/apply-reward', async (req, res) => {
+  if (!meuAuthOk(req)) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
   let programId = 'unknown'; // only for the error log; set from the venue's config row once it is found
   try {
 
@@ -1271,7 +1293,7 @@ app.post('/meu/apply-reward', async (req, res) => {
     }
 
     // Guests without a membership, other offers and promo codes are out of scope: nothing to apply.
-    if (!membership || !membership.externalId || !rewards || rewards.offer !== MEU_OFFER_ID) {
+    if (!membership || (!membership.externalId && !membership.id) || !rewards || rewards.offer !== MEU_OFFER_ID) {
       return res.status(200).json({ status: 'ok', rewards: [] });
     }
 
@@ -1279,7 +1301,21 @@ app.post('/meu/apply-reward', async (req, res) => {
     if (!partner) return res.status(404).json({ status: 'error', message: 'Venue not configured for me&u' });
     programId = partner.programId;
 
-    const result = await meuApply({ partner, externalId: membership.externalId, cart });
+    let externalId = membership.externalId;
+    if (!externalId && membership.id) {
+      const linkRows = await queryDatabase(
+        `SELECT external_id FROM meu_member_linking WHERE membership_id = $1 AND program_id = $2 LIMIT 1`,
+        [membership.id, programId]
+      );
+      if (linkRows.length) {
+        externalId = linkRows[0].external_id;
+      }
+    }
+    if (!externalId) {
+      return res.status(404).json({ status: 'error', message: 'Member linking not found' });
+    }
+
+    const result = await meuApply({ partner, externalId, cart });
     if (result.error) return res.status(404).json({ status: 'error', message: result.error });
 
     const { calc } = result;
@@ -1334,6 +1370,7 @@ async function meuResolveMember(client, membership, programId) {
 // Stores the cart into that partner's OWN three tables (meu_<prefix>_transactions/_sales/_payments,
 // resolved from venue+program), not a shared table -- one header row, one row per item, one row per
 // discount. No aura_transactions_raw write any more; this replaces that entirely.
+
 async function meuStoreCartEvent(payload, eventType) {
   const { programId, programName, membership, venue, cart } = payload || {};
   if (!programId || !venue || !venue.id || !cart || !cart.id) {
@@ -1464,7 +1501,7 @@ async function meuStoreCartEvent(payload, eventType) {
            (transaction_id, site_id, pos_updated_at, trx_raw_processed, member, check_total)
          VALUES ($1,$2,$3,$4,$5,$6)
          ON CONFLICT (transaction_id, site_id) DO NOTHING`,
-        [transactionId, siteId, posUpdatedAt, true,
+        [transactionId, siteId, posUpdatedAt, IS_TESTING,
          externalId ? JSON.stringify({ cardNumber: externalId }) : null, checkTotal]
       );
 
