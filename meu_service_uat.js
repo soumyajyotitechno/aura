@@ -1,4 +1,4 @@
-require('dotenv').config(); // no-op in Lambda (no .env there); loads local env for `node index.js`
+//require('dotenv').config(); // no-op in Lambda (no .env there); loads local env for `node index.js`
 const { Pool } = require('pg');
 const express = require('express');
 const serverless = require('serverless-http');
@@ -1004,16 +1004,13 @@ function getFinalTrxAmount(event) {
     (sum, item) => sum + item.amountInCents * item.quantity,
     0
   );
-  console.log("itemsTotal",itemsTotal)
-  const externalDiscountTotal = (cart.discounts ?? [])
-    .filter((d) => d.isInternal === false)
-    .reduce((sum, d) => sum + d.amountInCents, 0);
 
-    console.table({itemsTotal,externalDiscountTotal})
-  // never go below zero
-  const finalTrxAmountInCents = Math.max(0, itemsTotal - externalDiscountTotal);
+  const discounts = cart.discounts ?? [];
+  const discountTotal = discounts.reduce((sum, d) => sum + d.amountInCents, 0);
 
-  return finalTrxAmountInCents; // divide by 100 for dollars
+  console.table({ itemsTotal, discountTotal });
+
+  return Math.max(0, itemsTotal - discountTotal);
 }
 
 async function meuBackfillLinkFromClaim(programId, membership) {
@@ -1118,3 +1115,5 @@ exports.handler = async (event, context) => {
 
   return handler(event, context);
 };
+
+
