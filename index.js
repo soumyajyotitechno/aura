@@ -6,7 +6,7 @@ const axios = require('axios')
 const crypto = require('crypto');
 // const verifyImposSignature = require('./verifyImposSignature'); // TODO: restore once you have the real file -- the local stub was removed
 const app = express();
-const IS_TESTING = true;
+const IS_TESTING = false;
 
 // API hit log: one line per request (method, path, status, ms) for EVERY route. me&u routes also print the request and
 // response bodies, with mobile/email masked; headers and query strings are never logged. MEU_LOG_BODIES=false turns bodies off.
@@ -829,7 +829,8 @@ async function updateTransactionWithClaimedMember(client, {
   if (siteId !== null && sourceTransactionsTable) {
     await client.query(
       `UPDATE ${sourceTransactionsTable}
-       SET member = $1
+       SET member = $1,
+       trx_raw_processed  = false
        WHERE transaction_id = $2 AND site_id = $3`,
       [externalId ? JSON.stringify({ cardNumber: externalId }) : null, transactionId, siteId]
     );
