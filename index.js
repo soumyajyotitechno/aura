@@ -1338,23 +1338,6 @@ app.post('/meu/register-member', async (req, res) => {
     }
     const { partner_id: partnerId, registration_referrer_id: referrerId } = configured.rows[0];
 
-    /*
-     * FUTURE EXTERNAL AURA-MEMBER API REPLACEMENT — START
-     *
-     * When getExternalMember(...) and createMemberAPI(...) are available and tested,
-     * replace ONLY this marked block (up to the END marker below). Do NOT run the
-     * external create call together with this direct aura_customer INSERT/UPDATE,
-     * otherwise a customer can be created twice.
-    *
-     * The replacement must finish by setting both variables used by the unchanged
-     * link block below:
-     *   memberId   = Aura customer UUID returned by the external API
-     *   externalId = Aura referral/card ID returned by the external API
-     *
-     * Keep the config lookup above, the meu_member_linking upsert below, the
-     * transaction handling, logs, and response unchanged.
-     */
-
     // Retry-safe: a repeated me&u registration request reuses its original Aura customer.
     step = 'customer';
     // const ext = await getExternalMember({ email: membership.email, phone: membership.mobile, referrerId:registration_referrer_id });
@@ -1383,6 +1366,21 @@ app.post('/meu/register-member', async (req, res) => {
     let externalId;
     if (customer.rowCount) {
       ({ member_id: memberId, referral_id: externalId } = customer.rows[0]);
+      const existingLink = await client.query(
+        `SELECT membership_id
+         FROM meu_member_linking
+         WHERE partner_id = $1 AND member_id = $2
+         LIMIT 1`,
+        [partnerId, memberId]
+      );
+      if (existingLink.rowCount) {
+        await client.query('ROLLBACK');
+        return res.status(200).json({
+          status: 'ok',
+          message: 'Customer already exists',
+          membership: { id: existingLink.rows[0].membership_id },
+        });
+      }
       await client.query(
         `UPDATE aura_customer
          SET given_name = COALESCE($1, given_name), family_name = COALESCE($2, family_name),
@@ -1395,7 +1393,6 @@ app.post('/meu/register-member', async (req, res) => {
          incomingMeuMembershipId || null, memberId]
       );
     } else {
-      // Aura referral_id is the external/card identifier. A numeric value works with existing barcode flows.
       externalId = String(crypto.randomInt(100000000000, 1000000000000));
       const inserted = await client.query(
         `INSERT INTO aura_customer
@@ -1409,21 +1406,34 @@ app.post('/meu/register-member', async (req, res) => {
       ({ member_id: memberId, referral_id: externalId } = inserted.rows[0]);
     }
 
-    // FUTURE EXTERNAL AURA-MEMBER API REPLACEMENT — END
-
     step = 'link';
     // This is the provider membership id that me&u receives in the response.
     // For a fresh registration it is Aura's new UUID; an optional me&u id is retained when supplied.
     const providerMembershipId = incomingMeuMembershipId || String(memberId);
-    await client.query(
+    const linked = await client.query(
       `INSERT INTO meu_member_linking
          (member_id, external_id, membership_id, partner_id, program_id, created_at, updated_at)
        VALUES ($1,$2,$3,$4,$5,NOW(),NOW())
-       ON CONFLICT (partner_id, member_id) DO UPDATE SET
-         external_id = EXCLUDED.external_id, membership_id = EXCLUDED.membership_id,
-         program_id = EXCLUDED.program_id, updated_at = NOW()`,
+       ON CONFLICT (partner_id, member_id) DO NOTHING
+       RETURNING membership_id`,
       [memberId, externalId, providerMembershipId, partnerId, programId]
     );
+
+    if (!linked.rowCount) {
+      const existingLink = await client.query(
+        `SELECT membership_id
+         FROM meu_member_linking
+         WHERE partner_id = $1 AND member_id = $2
+         LIMIT 1`,
+        [partnerId, memberId]
+      );
+      await client.query('COMMIT');
+      return res.status(200).json({
+        status: 'ok',
+        message: 'Customer already exists',
+        membership: { id: existingLink.rows[0].membership_id },
+      });
+    }
 
     await client.query('COMMIT');
     console.log('[meu] register-member stored', JSON.stringify({
