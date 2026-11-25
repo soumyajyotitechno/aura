@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "dev": "nodemon"
+    "dev": "nodemon",
+    "test:external-id": "node --test tests/external-id-api.test.js"
   },
   "dependencies": {
     "axios": "^1.6.0",
